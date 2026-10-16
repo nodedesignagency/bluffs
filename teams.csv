@@ -1,10 +1,10 @@
-city,shell_hex,stripe_hex,facemask_hex,text,text_hex,outline_hex,text_style
-Buffalo,#F2F2F2,#C8102E,#9EA2A2,BUF,#1D3F94,#C8102E,
-Buffalo Inverted,#F2F2F2,#1D3F94,#9EA2A2,BUF,#C8102E,#1D3F94,
-Miami,#F2F2F2,#FC4C02,#9EA2A2,DOL,#008E97,#FC4C02,
-Miami Inverted,#F2F2F2,#008E97,#9EA2A2,DOL,#FC4C02,#008E97,
-Miami Aqua,#008E97,#FC4C02,#9EA2A2,DOL,#FFFFFF,#FC4C02,
-Miami Aqua 3D,#008E97,#FC4C02,#FC4C02,DOL,#FFFFFF,#FC4C02,3d
-Los Angeles,#F2F2F2,#0A2A66,#F1B82D,,,,
-Baltimore,#1A1A1A,#6A2C91,#C9A227,,,,
-Detroit,#0B7A75,#C0C5CE,#0B1F33,,,,
+city,shell_hex,stripe_hex,facemask_hex,text,text_hex,outline_hex,text_style,stripe_width
+Buffalo,#F2F2F2,#C8102E,#9EA2A2,BUF,#1D3F94,#C8102E,,
+Buffalo Inverted,#F2F2F2,#1D3F94,#9EA2A2,BUF,#C8102E,#1D3F94,,
+Miami,#F2F2F2,#FC4C02,#9EA2A2,DOL,#008E97,#FC4C02,,
+Miami Inverted,#F2F2F2,#008E97,#9EA2A2,DOL,#FC4C02,#008E97,,
+Miami Aqua,#008E97,#FC4C02,#9EA2A2,DOL,#FFFFFF,#FC4C02,,
+Miami Aqua 3D,#008E97,#FC4C02,#FC4C02,DOL,#FFFFFF,#FC4C02,3d,67
+Los Angeles,#F2F2F2,#0A2A66,#F1B82D,,,,,
+Baltimore,#1A1A1A,#6A2C91,#C9A227,,,,,
+Detroit,#0B7A75,#C0C5CE,#0B1F33,,,,,

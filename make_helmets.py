@@ -98,6 +98,20 @@ def parse_hex(value: str) -> tuple[int, int, int]:
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def parse_percent(value: str, name: str) -> float:
+    """'67', '67%' -> 0.67; blank -> 1.0. Must be 1..100."""
+    s = value.strip().rstrip("%").strip()
+    if not s:
+        return 1.0
+    try:
+        pct = float(s)
+    except ValueError:
+        raise ValueError(f"{name} must be a percentage like 67 or 67%, got {value!r}")
+    if not 0 < pct <= 100:
+        raise ValueError(f"{name} must be between 1 and 100, got {value!r}")
+    return pct / 100.0
+
+
 def to_hex(rgb) -> str:
     return "#{:02X}{:02X}{:02X}".format(*rgb)
 
@@ -340,6 +354,48 @@ def calibrate_hues(hue, chroma, alpha):
     return centers
 
 
+def grow_distance(seed, region, limit=2000):
+    """Distance in px from `seed` to each pixel of `region`, walking only
+    through `region` (alternating 4- and 8-neighbour steps, close to
+    Euclidean). Unreached pixels stay inf."""
+    dist = np.full(seed.shape, np.inf, np.float32)
+    dist[seed] = 0.0
+    reached = seed.copy()
+    for step in range(1, limit + 1):
+        if step % 2:
+            grown = reached.copy()
+            grown[1:] |= reached[:-1]
+            grown[:-1] |= reached[1:]
+            grown[:, 1:] |= reached[:, :-1]
+            grown[:, :-1] |= reached[:, 1:]
+        else:
+            grown = dilate(reached, 1)
+        new = grown & region & ~reached
+        if not new.any():
+            break
+        dist[new] = step
+        reached |= new
+    return dist
+
+
+def stripe_distances(alpha, weights, scale):
+    """How far each stripe pixel is from the stripe's shell-side edge and
+    from its outer edge (silhouette / facemask), for narrowing the stripe."""
+    solid = alpha > 0.5
+    stripe = solid & (weights[..., 1] > 0.5)
+    shell = solid & (weights[..., 0] > 0.5)
+    # Thin shell-coloured slots cut into the stripe are not its edge.
+    r = max(1, round(12 * scale))
+    body = dilate(~dilate(~shell, r), r) & shell
+    region = stripe | (shell & ~body)
+    near = grow_distance(body, region)
+    far = grow_distance(~region & ~body, region)
+    off = ~stripe
+    near[off] = np.inf
+    far[off] = np.inf
+    return near, far
+
+
 @dataclass
 class HelmetMaps:
     """Everything the recolour needs, in the cropped master's pixel grid."""
@@ -349,10 +405,29 @@ class HelmetMaps:
     shade: np.ndarray     # (H, W) diffuse light relative to each part's base tone
     gloss: np.ndarray     # (H, W) additive white from glossy highlights (linear)
     neutral: np.ndarray   # (H, W) grey level for neutral pixels (linear)
+    stripe_near: np.ndarray  # (H, W) px from the stripe's shell-side edge (inf off the stripe)
+    stripe_far: np.ndarray   # (H, W) px from the stripe's outer edge (inf off the stripe)
 
     def flipped(self) -> HelmetMaps:
         return HelmetMaps(*(np.ascontiguousarray(a[:, ::-1]) for a in
-                            (self.alpha, self.weights, self.paint, self.shade, self.gloss, self.neutral)))
+                            (self.alpha, self.weights, self.paint, self.shade, self.gloss, self.neutral,
+                             self.stripe_near, self.stripe_far)))
+
+    def part_weights(self, stripe_width=1.0):
+        """Part weights with the stripe narrowed to `stripe_width` (0..1) of
+        its width. The stripe gives up its shell-side edge to the shell, so
+        it keeps its shape and its outer edge."""
+        if stripe_width >= 1.0:
+            return self.weights
+        near, far = self.stripe_near, self.stripe_far
+        with np.errstate(invalid="ignore"):
+            edge = (near - 0.5) - (1.0 - stripe_width) * ((near - 0.5) + (far - 0.5))
+        keep = np.where(np.isfinite(edge), smoothstep(-1.0, 1.0, np.nan_to_num(edge, nan=1.0)), 1.0)
+        w = self.weights.copy()
+        moved = w[..., 1] * (1.0 - keep)
+        w[..., 1] -= moved
+        w[..., 0] += moved
+        return w
 
     @property
     def size(self):
@@ -429,9 +504,11 @@ def analyse_master(path, pad=6):
     gloss = smooth_within_parts(gloss, weights, support, 0.5 * scale)
 
     neutral = lin @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    stripe_near, stripe_far = stripe_distances(alpha, weights, scale)
 
     maps = HelmetMaps(alpha, weights.astype(np.float32), paint.astype(np.float32),
-                      shade.astype(np.float32), gloss.astype(np.float32), neutral.astype(np.float32))
+                      shade.astype(np.float32), gloss.astype(np.float32), neutral.astype(np.float32),
+                      stripe_near, stripe_far)
     info = {"crop": (x0, y0, x1, y1), "scale": scale, "hues": centers,
             "base": [to_hex(np.round(linear_to_srgb(b) * 255).astype(int)) for b in base]}
     return maps, info
@@ -532,46 +609,51 @@ def place_lettering(mask, mcx, mcy, ss, layout: TextLayout, shape, q=3, style="f
     """
     H, W = shape
     out = np.zeros(shape, np.float32)
-    mh, mw = mask.shape
-    reach = max(math.hypot(x - mcx, y - mcy) for x in (0, mw) for y in (0, mh)) / ss + 2
+    ink_rows = np.nonzero(mask.max(1) > 0)[0]
+    ink_cols = np.nonzero(mask.max(0) > 0)[0]
+    if len(ink_rows) == 0:
+        return out
+    # Neither warp moves a point further from the centre than it is on the
+    # flat mask, so the ink extent bounds the area to compute.
+    reach = max(math.hypot(x - mcx, y - mcy)
+                for x in (ink_cols[0], ink_cols[-1] + 1) for y in (ink_rows[0], ink_rows[-1] + 1)) / ss + 3
     cx, cy = layout.center
     x0, x1 = max(int(cx - reach), 0), min(int(cx + reach) + 1, W)
     y0, y1 = max(int(cy - reach), 0), min(int(cy + reach) + 1, H)
     if x0 >= x1 or y0 >= y1:
         return out
+
+    # q x q sub-samples per pixel, all sampled in one pass.
+    sub = (np.arange(q, dtype=np.float32) + 0.5) / q
+    oy, ox = (a.reshape(-1, 1, 1) for a in np.meshgrid(sub, sub, indexing="ij"))
     ys, xs = np.mgrid[y0:y1, x0:x1].astype(np.float32)
-    t = math.radians(layout.tilt_deg)
-    ct, st = math.cos(t), math.sin(t)
-    R = layout.arc_radius
+    px, py = xs[None] + ox, ys[None] + oy
     if style == "3d":
+        # Point on the sphere under each sample, then its geodesic offset
+        # from the text centre (azimuthal equidistant), in px.
         normal, e_along, e_down = sphere_frame(layout)
         (scx, scy), sr = layout.sphere_center, layout.sphere_radius
-    acc = np.zeros(ys.shape, np.float32)
-    for oy in range(q):
-        for ox in range(q):
-            px = xs + (ox + 0.5) / q
-            py = ys + (oy + 0.5) / q
-            if style == "3d":
-                # Point on the sphere under this pixel, then its geodesic
-                # offset from the text centre (azimuthal equidistant), in px.
-                X, Y = (px - scx) / sr, (py - scy) / sr
-                Z = np.sqrt(np.clip(1.0 - X * X - Y * Y, 0.0, None))
-                cos_d = np.clip(X * normal[0] + Y * normal[1] + Z * normal[2], -1.0, 1.0)
-                qx, qy, qz = X - cos_d * normal[0], Y - cos_d * normal[1], Z - cos_d * normal[2]
-                qn = np.sqrt(qx * qx + qy * qy + qz * qz)
-                k = np.where(qn > 1e-7, np.arccos(cos_d) / np.maximum(qn, 1e-7), 1.0) * sr
-                along = (qx * e_along[0] + qy * e_along[1] + qz * e_along[2]) * k
-                down = (qx * e_down[0] + qy * e_down[1] + qz * e_down[2]) * k
-                visible = (X * X + Y * Y < 1.0) & (cos_d > 0.0)
-                acc += bilinear(mask, mcy + down * ss, mcx + along * ss) * visible
-            else:
-                u = (px - cx) * ct - (py - cy) * st       # along the lettering
-                v = (px - cx) * st + (py - cy) * ct       # down, across the lettering
-                up = R - v                                # arc centre sits R below the text
-                along = R * np.arctan2(u, up)
-                height = np.hypot(u, up) - R
-                acc += bilinear(mask, mcy - height * ss, mcx + along * ss)
-    out[y0:y1, x0:x1] = np.clip(acc / (q * q), 0.0, 1.0)
+        X, Y = (px - scx) / sr, (py - scy) / sr
+        Z = np.sqrt(np.clip(1.0 - X * X - Y * Y, 0.0, None))
+        cos_d = np.clip(X * normal[0] + Y * normal[1] + Z * normal[2], -1.0, 1.0)
+        qx, qy, qz = X - cos_d * normal[0], Y - cos_d * normal[1], Z - cos_d * normal[2]
+        qn = np.sqrt(qx * qx + qy * qy + qz * qz)
+        k = np.where(qn > 1e-7, np.arccos(cos_d) / np.maximum(qn, 1e-7), 1.0) * sr
+        along = (qx * e_along[0] + qy * e_along[1] + qz * e_along[2]) * k
+        down = (qx * e_down[0] + qy * e_down[1] + qz * e_down[2]) * k
+        samples = bilinear(mask, mcy + down * ss, mcx + along * ss)
+        samples *= (X * X + Y * Y < 1.0) & (cos_d > 0.0)
+    else:
+        t = math.radians(layout.tilt_deg)
+        ct, st = math.cos(t), math.sin(t)
+        R = layout.arc_radius
+        u = (px - cx) * ct - (py - cy) * st       # along the lettering
+        v = (px - cx) * st + (py - cy) * ct       # down, across the lettering
+        up = R - v                                # arc centre sits R below the text
+        along = R * np.arctan2(u, up)
+        height = np.hypot(u, up) - R
+        samples = bilinear(mask, mcy - height * ss, mcx + along * ss)
+    out[y0:y1, x0:x1] = np.clip(samples.mean(0), 0.0, 1.0)
     return out
 
 
@@ -596,23 +678,25 @@ def compress_highlights(rgb):
     return scaled + (1.0 - scaled) * (1.0 - 1.0 / over)
 
 
-def render_helmet(maps: HelmetMaps, colors, text_color=None, fill=None, outline_color=None, outer=None):
+def render_helmet(maps: HelmetMaps, colors, text_color=None, fill=None, outline_color=None, outer=None,
+                  stripe_width=1.0):
     """Recolour the helmet. `fill` / `outer` are text coverage maps (outer =
     letters plus outline); the text is painted on the shell only."""
     lin = lambda rgb: srgb_to_linear(np.asarray(rgb, dtype=np.float32) / 255.0)
     team = lin(colors)                                                        # (3, 3)
-    albedo = maps.weights @ team
+    weights = maps.part_weights(stripe_width)
+    albedo = weights @ team
     if fill is not None:
         shell = team[0]
         decal = shell + np.zeros_like(albedo)
         if outer is not None:
             decal += outer[..., None] * (lin(outline_color) - decal)
         decal += fill[..., None] * (lin(text_color) - decal)
-        albedo = albedo + maps.weights[..., :1] * (decal - shell)
+        albedo = albedo + weights[..., :1] * (decal - shell)
     gloss = maps.gloss
     if fill is not None:
         # Keep some shine on the text but let it read as solid paint.
-        cover = (outer if outer is not None else fill) * maps.weights[..., 0]
+        cover = (outer if outer is not None else fill) * weights[..., 0]
         gloss = gloss * (1.0 - TEXT_GLOSS_CUT * cover)
     lit = compress_highlights(shoulder(maps.shade[..., None] * albedo) + gloss[..., None])
     paint = maps.paint[..., None]
@@ -721,6 +805,7 @@ def read_teams(path: Path):
                                           else pick_text_color(team["shell"], team["stripe"], team["facemask"]))
                     if get("outline_hex"):
                         team["outline"] = parse_hex(get("outline_hex"))
+                team["stripe_width"] = parse_percent(get("stripe_width"), "stripe_width")
                 team["text_style"] = get("text_style").lower() or "flat"
                 if team["text_style"] not in TEXT_STYLES:
                     raise ValueError(f"text_style must be one of {', '.join(TEXT_STYLES)}, "
@@ -798,7 +883,8 @@ def main(argv=None):
                 fill = place_lettering(fill_mask, mcx, mcy, ss, layout, maps.alpha.shape, style=style)
                 if outer_mask is not None:
                     outer = place_lettering(outer_mask, mcx, mcy, ss, layout, maps.alpha.shape, style=style)
-            img = render_helmet(maps, colors, team["text_color"], fill, team["outline"], outer)
+            img = render_helmet(maps, colors, team["text_color"], fill, team["outline"], outer,
+                                stripe_width=team["stripe_width"])
             img = fit_to_canvas(img, args.size, args.margin)
             img.save(args.out / f"{slug}_{side}.png")
             outputs[side] = img
@@ -808,6 +894,8 @@ def main(argv=None):
             text_note += f" outline {to_hex(team['outline'])}"
         if team["text"] and team["text_style"] != "flat":
             text_note += f" ({team['text_style']})"
+        if team["stripe_width"] < 1.0:
+            text_note += f", stripe {team['stripe_width']:.0%} width"
         print(f"  {team['city']}: shell {to_hex(team['shell'])}, stripe {to_hex(team['stripe'])}, "
               f"facemask {to_hex(team['facemask'])}{text_note} -> {slug}_right/left.png")
 

@@ -27,6 +27,7 @@ Every file has the same canvas size, position and scale (default 1024×1024, `--
 | `text_hex` | no | text color. If blank, the most contrasting of stripe/facemask is used, or white/black. |
 | `outline_hex` | no | outline around the letters. Leave blank for no outline. |
 | `text_style` | no | `flat` (default) or `3d`: wraps the text around the shell so it curves and foreshortens like a real decal. |
+| `stripe_width` | no | stripe width as a percentage, e.g. `67` for a third narrower. Blank = 100. |
 
 Hex values can be `#RRGGBB`, `RRGGBB` or `#RGB`.
 
