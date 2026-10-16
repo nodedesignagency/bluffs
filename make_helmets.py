@@ -7,7 +7,7 @@ background, painted with ID colours:
     shell = red        top stripe = green        facemask = blue
 
 For every row of the teams CSV (city, shell_hex, stripe_hex, facemask_hex,
-plus optional text and text_hex) this writes
+plus optional text, text_hex and outline_hex) this writes
 
     <out>/<City>_right.png    helmet facing right
     <out>/<City>_left.png     helmet facing left (lettering placed after the flip)
@@ -45,17 +45,19 @@ ID_HUES = (0.0, 120.0, 240.0)
 # Where the helmet text goes on the right-facing master, in master pixels. Tuned
 # on a 1536 px wide master and scaled automatically for other sizes.
 REFERENCE_WIDTH = 1536
+TEXT_GLOSS_CUT = 0.6   # how much of the shell's glossy highlight is removed on the text
 
 
 @dataclass(frozen=True)
 class TextLayout:
-    center: tuple[float, float] = (400.0, 628.0)  # middle of the lettering
-    max_width: float = 320.0     # lettering never gets wider than this
-    cap_height: float = 76.0     # preferred capital height; long names shrink
-    arc_radius: float = 1100.0   # radius of the arc the baseline follows
-    tilt_deg: float = 3.0        # > 0 rises toward the facemask
-    tracking: float = 0.03       # extra letter spacing, fraction of cap height
+    center: tuple[float, float] = (575.0, 450.0)  # middle of the text, upper side of the shell
+    max_width: float = 350.0     # text never gets wider than this
+    cap_height: float = 210.0    # letter height; longer text shrinks to fit
+    arc_radius: float = 1500.0   # radius of the arc the baseline follows
+    tilt_deg: float = 4.0        # > 0 rises toward the facemask
+    tracking: float = 0.04       # extra letter spacing, fraction of cap height
     min_squeeze: float = 0.82    # condense this far before shrinking the size
+    outline: float = 0.05        # outline thickness (if used), fraction of cap height
 
     def scaled(self, k: float) -> TextLayout:
         return replace(
@@ -438,18 +440,20 @@ def load_font(font_path, size):
         raise SystemExit(f"could not load font {font_path}: {exc}")
 
 
-def render_lettering(text, font_path, layout: TextLayout, ss=4):
-    """Flat lettering mask at `ss` x master scale, fitted to the layout.
+def render_lettering(text, font_path, layout: TextLayout, ss=4, outline=False):
+    """Flat text masks at `ss` x master scale, fitted to the layout.
 
-    Returns (mask, centre column, centre row) in mask pixels.
+    Returns (fill mask, outline mask or None, centre column, centre row); the
+    outline mask covers the letters plus their outline.
     """
     probe = load_font(font_path, 200)
     cap_ratio = -probe.getbbox("H", anchor="ls")[1] / 200.0
+    stroke = layout.outline if outline else 0.0
 
     def natural_width(cap):
         f = load_font(font_path, max(1, round(cap / cap_ratio)))
         l, _, r, _ = f.getbbox(text, anchor="ls")
-        return (r - l) + layout.tracking * cap * (len(text) - 1)
+        return (r - l) + layout.tracking * cap * (len(text) - 1) + 2 * stroke * cap
 
     cap = layout.cap_height
     width = natural_width(cap)
@@ -462,24 +466,33 @@ def render_lettering(text, font_path, layout: TextLayout, ss=4):
     font = load_font(font_path, max(1, round(cap * ss / cap_ratio)))
     cap_ss = cap_ratio * font.size
     track = layout.tracking * cap * ss
-    pad = int(cap_ss * 0.6) + 4
+    stroke_px = max(1, round(stroke * cap_ss)) if outline else 0
+    pad = int(cap_ss * 0.6) + stroke_px + 4
     advance = [font.getlength(text[:i]) + i * track for i in range(len(text) + 1)]
     W = int(math.ceil(advance[-1])) + 2 * pad
     H = int(math.ceil(cap_ss)) + 2 * pad
-    canvas = Image.new("L", (W, H), 0)
-    draw = ImageDraw.Draw(canvas)
     baseline = pad + cap_ss
-    for i, ch in enumerate(text):
-        draw.text((pad + advance[i], baseline), ch, font=font, fill=255, anchor="ls")
 
-    ink = canvas.getbbox()
+    def draw_mask(stroke_width):
+        canvas = Image.new("L", (W, H), 0)
+        draw = ImageDraw.Draw(canvas)
+        for i, ch in enumerate(text):
+            draw.text((pad + advance[i], baseline), ch, font=font, fill=255, anchor="ls",
+                      stroke_width=stroke_width, stroke_fill=255)
+        return canvas
+
+    canvases = [draw_mask(0)] + ([draw_mask(stroke_px)] if outline else [])
+    ink = canvases[-1].getbbox()
     if ink is None:
         raise SystemExit(f"font {font_path} rendered nothing for {text!r}")
-    if squeeze != 1.0:
-        canvas = canvas.resize((max(1, round(W * squeeze)), H), Image.LANCZOS)
+    masks = []
+    for canvas in canvases:
+        if squeeze != 1.0:
+            canvas = canvas.resize((max(1, round(W * squeeze)), H), Image.LANCZOS)
+        masks.append(np.asarray(canvas, dtype=np.float32) / 255.0)
     cx = (ink[0] + ink[2]) / 2 * squeeze
     cy = baseline - cap_ss / 2
-    return np.asarray(canvas, dtype=np.float32) / 255.0, cx, cy
+    return masks[0], (masks[1] if outline else None), cx, cy
 
 
 def place_lettering(mask, mcx, mcy, ss, layout: TextLayout, shape, q=3):
@@ -536,14 +549,25 @@ def compress_highlights(rgb):
     return scaled + (1.0 - scaled) * (1.0 - 1.0 / over)
 
 
-def render_helmet(maps: HelmetMaps, colors, text_color=None, lettering=None):
-    team = srgb_to_linear(np.asarray(colors, dtype=np.float32) / 255.0)    # (3, 3)
+def render_helmet(maps: HelmetMaps, colors, text_color=None, fill=None, outline_color=None, outer=None):
+    """Recolour the helmet. `fill` / `outer` are text coverage maps (outer =
+    letters plus outline); the text is painted on the shell only."""
+    lin = lambda rgb: srgb_to_linear(np.asarray(rgb, dtype=np.float32) / 255.0)
+    team = lin(colors)                                                        # (3, 3)
     albedo = maps.weights @ team
-    if lettering is not None:
-        cover = (lettering * maps.weights[..., 0])[..., None]                  # on the shell only
-        letter = srgb_to_linear(np.asarray(text_color, dtype=np.float32) / 255.0)
-        albedo = albedo + cover * (letter - team[0])
-    lit = compress_highlights(shoulder(maps.shade[..., None] * albedo) + maps.gloss[..., None])
+    if fill is not None:
+        shell = team[0]
+        decal = shell + np.zeros_like(albedo)
+        if outer is not None:
+            decal += outer[..., None] * (lin(outline_color) - decal)
+        decal += fill[..., None] * (lin(text_color) - decal)
+        albedo = albedo + maps.weights[..., :1] * (decal - shell)
+    gloss = maps.gloss
+    if fill is not None:
+        # Keep some shine on the text but let it read as solid paint.
+        cover = (outer if outer is not None else fill) * maps.weights[..., 0]
+        gloss = gloss * (1.0 - TEXT_GLOSS_CUT * cover)
+    lit = compress_highlights(shoulder(maps.shade[..., None] * albedo) + gloss[..., None])
     paint = maps.paint[..., None]
     out = paint * lit + (1.0 - paint) * maps.neutral[..., None]
     rgb8 = np.round(linear_to_srgb(out) * 255).astype(np.uint8)
@@ -575,7 +599,7 @@ def contact_sheet(entries, path, font_path, thumb=300):
     n = len(entries)
     cols = max(1, math.ceil(math.sqrt(n / 2)))
     rows = math.ceil(n / cols)
-    gap, label_h = 16, 78
+    gap, label_h = 16, 104
     cell_w, cell_h = 2 * thumb + gap, thumb + label_h
     W = cols * cell_w + (cols + 1) * gap
     H = rows * cell_h + (rows + 1) * gap
@@ -600,11 +624,16 @@ def contact_sheet(entries, path, font_path, thumb=300):
             sheet.paste(t, (x, cy), t)
         ty = cy + thumb + 6
         draw.text((cx, ty), team["city"], font=title_font, fill=(240, 240, 240))
-        sx, sy = cx, ty + 44
+        sx, sy = cx, ty + 42
         swatches = [("shell", team["shell"]), ("stripe", team["stripe"]), ("mask", team["facemask"])]
         if team["text"]:
             swatches.append(("text", team["text_color"]))
+        if team["outline"]:
+            swatches.append(("outline", team["outline"]))
         for label, rgb in swatches:
+            need = 25 + int(draw.textlength(f"{label} #000000", font=small_font)) + 10
+            if sx > cx and sx + need > cx + cell_w:
+                sx, sy = cx, sy + 26
             draw.rectangle((sx, sy, sx + 18, sy + 18), fill=tuple(rgb), outline=(140, 140, 150))
             draw.text((sx + 25, sy + 9), label, font=small_font, fill=(150, 155, 165), anchor="lm")
             hx = sx + 25 + int(draw.textlength(label, font=small_font)) + 6
@@ -639,10 +668,12 @@ def read_teams(path: Path):
                         "facemask": parse_hex(get("facemask_hex"))}
                 # Text only when the CSV asks for it, exactly as written.
                 team["text"] = get("text")
-                team["text_color"] = None
+                team["text_color"] = team["outline"] = None
                 if team["text"]:
                     team["text_color"] = (parse_hex(get("text_hex")) if get("text_hex")
                                           else pick_text_color(team["shell"], team["stripe"], team["facemask"]))
+                    if get("outline_hex"):
+                        team["outline"] = parse_hex(get("outline_hex"))
             except ValueError as exc:
                 raise SystemExit(f"{path}:{line}: {exc}")
             teams.append(team)
@@ -666,8 +697,8 @@ def main(argv=None):
     ap.add_argument("--master", type=Path, default=HERE / "master_helmet.png")
     ap.add_argument("--teams", type=Path, default=HERE / "teams.csv")
     ap.add_argument("--out", type=Path, default=HERE / "output")
-    ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Oswald-Bold.ttf",
-                    help="bold condensed TTF/OTF for the helmet text")
+    ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Anton-Regular.ttf",
+                    help="TTF/OTF for the helmet text (default: Anton, heavy condensed)")
     ap.add_argument("--size", type=int, default=1024, help="square canvas size in px (default 1024)")
     ap.add_argument("--margin", type=float, default=0.04, help="empty border, fraction of the canvas")
     ap.add_argument("--no-preview", action="store_true", help="skip preview.png")
@@ -699,27 +730,32 @@ def main(argv=None):
         colors = (team["shell"], team["stripe"], team["facemask"])
         lettering = None
         if team["text"]:
-            lettering = render_lettering(team["text"], args.font, layout_right, ss=ss)
+            lettering = render_lettering(team["text"], args.font, layout_right, ss=ss,
+                                         outline=team["outline"] is not None)
 
         outputs = {}
         for side, maps, layout in (("right", maps_right, layout_right), ("left", maps_left, layout_left)):
             # The left helmet is the flipped render; its lettering is warped
             # onto the flipped shell afterwards, so it always reads normally.
-            letters = None
+            fill = outer = None
             if lettering is not None:
-                mask, mcx, mcy = lettering
-                letters = place_lettering(mask, mcx, mcy, ss, layout, maps.alpha.shape)
-            img = render_helmet(maps, colors, team["text_color"], letters)
+                fill_mask, outer_mask, mcx, mcy = lettering
+                fill = place_lettering(fill_mask, mcx, mcy, ss, layout, maps.alpha.shape)
+                if outer_mask is not None:
+                    outer = place_lettering(outer_mask, mcx, mcy, ss, layout, maps.alpha.shape)
+            img = render_helmet(maps, colors, team["text_color"], fill, team["outline"], outer)
             img = fit_to_canvas(img, args.size, args.margin)
             img.save(args.out / f"{slug}_{side}.png")
             outputs[side] = img
         entries.append((team, outputs["right"], outputs["left"]))
         text_note = f", text {team['text']!r} {to_hex(team['text_color'])}" if team["text"] else ", no text"
+        if team["outline"]:
+            text_note += f" outline {to_hex(team['outline'])}"
         print(f"  {team['city']}: shell {to_hex(team['shell'])}, stripe {to_hex(team['stripe'])}, "
               f"facemask {to_hex(team['facemask'])}{text_note} -> {slug}_right/left.png")
 
     if not args.no_preview:
-        contact_sheet(entries, args.out / "preview.png", args.font)
+        contact_sheet(entries, args.out / "preview.png", HERE / "fonts" / "Oswald-Bold.ttf")
         print(f"wrote {args.out / 'preview.png'}")
 
 

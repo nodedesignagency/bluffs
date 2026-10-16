@@ -23,8 +23,9 @@ Every file has the same canvas size, position and scale (default 1024×1024, `--
 | `shell_hex` | yes | shell color (the red ID area) |
 | `stripe_hex` | yes | top stripe color (the green ID area) |
 | `facemask_hex` | yes | facemask color (the blue ID area) |
-| `text` | no | text to put on the side of the shell, drawn exactly as written. Leave blank for no text. |
+| `text` | no | text for the side of the shell, drawn big and exactly as written (made for 3 letters like `BUF`; longer text shrinks to fit). Leave blank for no text. |
 | `text_hex` | no | text color. If blank, the most contrasting of stripe/facemask is used, or white/black. |
+| `outline_hex` | no | outline around the letters. Leave blank for no outline. |
 
 Hex values can be `#RRGGBB`, `RRGGBB` or `#RGB`.
 
@@ -35,10 +36,12 @@ shell = red, top stripe = green, facemask = blue. Neutral parts (pads, screws) k
 original color. Replace the file with your own render, or pass `--master path.png`.
 Run with `--debug` to write `output/debug_masks.png` (matte, part masks, paint mask, shading).
 
-The text position and curve are set in `TextLayout` at the top of `make_helmets.py`
+The text size, position and curve are set in `TextLayout` at the top of `make_helmets.py`
 (in master-image pixels for the right-facing helmet). The left version uses the mirrored
 position, and the text is drawn after the flip, so it never reads backwards.
 
-## Font
+## Fonts
 
-`fonts/Oswald-Bold.ttf` (SIL Open Font License, see `fonts/OFL.txt`). Use `--font` for another font.
+Helmet text uses `fonts/Anton-Regular.ttf` (heavy condensed, Impact-style). Use `--font` for another
+TTF/OTF. The preview labels use `fonts/Oswald-Bold.ttf`. Both are SIL Open Font License
+(`fonts/OFL-Anton.txt`, `fonts/OFL-Oswald.txt`).
