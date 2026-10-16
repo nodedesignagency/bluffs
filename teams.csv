@@ -1,5 +1,6 @@
 city,shell_hex,stripe_hex,facemask_hex,text,text_hex,outline_hex
-Buffalo,#0E3B8C,#E03A3E,#FFFFFF,,,
+Buffalo,#F2F2F2,#C8102E,#9EA2A2,BUF,#1D3F94,#C8102E
+Buffalo Inverted,#F2F2F2,#1D3F94,#9EA2A2,BUF,#C8102E,#1D3F94
 Los Angeles,#F2F2F2,#0A2A66,#F1B82D,,,
 Baltimore,#1A1A1A,#6A2C91,#C9A227,,,
 Detroit,#0B7A75,#C0C5CE,#0B1F33,,,
