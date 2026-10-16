@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+"""Generate team-coloured football helmets from one ID-coloured master render.
+
+The master image is a side-profile helmet facing right on a plain light
+background, painted with ID colours:
+
+    shell = red        top stripe = green        facemask = blue
+
+For every row of the teams CSV (city, shell_hex, stripe_hex, facemask_hex,
+plus optional text and text_hex) this writes
+
+    <out>/<City>_right.png    helmet facing right
+    <out>/<City>_left.png     helmet facing left (lettering placed after the flip)
+    <out>/preview.png         contact sheet with every team
+
+Every PNG has a transparent background and shares one canvas size, position and
+scale, so they line up in an app.  Text goes on the shell only when the row's
+`text` column has something in it; it is drawn exactly as written.  Only
+Pillow and numpy are required.
+
+    python make_helmets.py
+    python make_helmets.py --teams teams.csv --out output --size 1024
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import re
+import sys
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+HERE = Path(__file__).resolve().parent
+PARTS = ("shell", "stripe", "facemask")
+
+# Nominal ID hues (degrees). The real hues are measured from the master, these
+# are only the starting points for that search.
+ID_HUES = (0.0, 120.0, 240.0)
+
+# Where the helmet text goes on the right-facing master, in master pixels. Tuned
+# on a 1536 px wide master and scaled automatically for other sizes.
+REFERENCE_WIDTH = 1536
+
+
+@dataclass(frozen=True)
+class TextLayout:
+    center: tuple[float, float] = (400.0, 628.0)  # middle of the lettering
+    max_width: float = 320.0     # lettering never gets wider than this
+    cap_height: float = 76.0     # preferred capital height; long names shrink
+    arc_radius: float = 1100.0   # radius of the arc the baseline follows
+    tilt_deg: float = 3.0        # > 0 rises toward the facemask
+    tracking: float = 0.03       # extra letter spacing, fraction of cap height
+    min_squeeze: float = 0.82    # condense this far before shrinking the size
+
+    def scaled(self, k: float) -> TextLayout:
+        return replace(
+            self,
+            center=(self.center[0] * k, self.center[1] * k),
+            max_width=self.max_width * k,
+            cap_height=self.cap_height * k,
+            arc_radius=self.arc_radius * k,
+        )
+
+    def shifted(self, dx: float, dy: float) -> TextLayout:
+        return replace(self, center=(self.center[0] + dx, self.center[1] + dy))
+
+    def mirrored(self, width: float) -> TextLayout:
+        """Same spot on the flipped helmet. The geometry is mirrored, the
+        letters are not: they are drawn fresh, reading left to right."""
+        return replace(self, center=(width - self.center[0], self.center[1]), tilt_deg=-self.tilt_deg)
+
+
+# --------------------------------------------------------------------------
+# Colour helpers
+# --------------------------------------------------------------------------
+
+def parse_hex(value: str) -> tuple[int, int, int]:
+    s = value.strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", s):
+        raise ValueError(f"not a hex colour: {value!r}")
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def to_hex(rgb) -> str:
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+def srgb_to_linear(c):
+    c = np.asarray(c, dtype=np.float32)
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4).astype(np.float32)
+
+
+def linear_to_srgb(c):
+    c = np.clip(c, 0.0, 1.0)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055).astype(np.float32)
+
+
+def relative_luminance(rgb) -> float:
+    lin = srgb_to_linear(np.asarray(rgb, dtype=np.float32) / 255.0)
+    return float(lin @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32))
+
+
+def contrast_ratio(a, b) -> float:
+    la, lb = sorted((relative_luminance(a), relative_luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def pick_text_color(shell, stripe, facemask):
+    """A team colour if one stands out against the shell, else white or black."""
+    best = max((stripe, facemask), key=lambda c: contrast_ratio(c, shell))
+    if contrast_ratio(best, shell) >= 3.0:
+        return best
+    white, black = (255, 255, 255), (16, 16, 16)
+    return white if contrast_ratio(white, shell) >= contrast_ratio(black, shell) else black
+
+
+def smoothstep(e0, e1, x):
+    t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def hue_degrees(rgb):
+    """HSV hue in degrees for an (..., 3) array in 0..1."""
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mx, mn = rgb.max(-1), rgb.min(-1)
+    c = np.maximum(mx - mn, 1e-6)
+    h = np.where(mx == r, (g - b) / c, np.where(mx == g, 2.0 + (b - r) / c, 4.0 + (r - g) / c))
+    return (h * 60.0) % 360.0
+
+
+def hue_distance(h, center):
+    d = np.abs(h - center) % 360.0
+    return np.minimum(d, 360.0 - d)
+
+
+# --------------------------------------------------------------------------
+# Small image-processing helpers (no SciPy / OpenCV needed)
+# --------------------------------------------------------------------------
+
+def blur(a, sigma):
+    """Separable Gaussian blur over the first two axes."""
+    out = np.asarray(a, dtype=np.float32)
+    if sigma <= 0:
+        return out
+    r = max(1, math.ceil(3 * sigma))
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k = (k / k.sum()).astype(np.float32)
+    for axis in (0, 1):
+        pad = [(0, 0)] * out.ndim
+        pad[axis] = (r, r)
+        p = np.pad(out, pad, mode="edge")
+        n = out.shape[axis]
+        acc = np.zeros_like(out)
+        for i, w in enumerate(k):
+            idx = [slice(None)] * out.ndim
+            idx[axis] = slice(i, i + n)
+            acc += w * p[tuple(idx)]
+        out = acc
+    return out
+
+
+def dilate(mask, radius):
+    """Binary dilation with a (2r+1)-wide square."""
+    out = mask
+    for axis in (0, 1):
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (radius, radius)
+        p = np.pad(out, pad)
+        n = out.shape[axis]
+        acc = np.zeros_like(out)
+        for i in range(2 * radius + 1):
+            acc |= p[i:i + n] if axis == 0 else p[:, i:i + n]
+        out = acc
+    return out
+
+
+def components_by_run(mask):
+    """4-connected components of a bool mask via run-length union-find.
+
+    Returns per-run arrays (row, start, end) and a component id per run.
+    """
+    H, W = mask.shape
+    padded = np.zeros((H, W + 2), np.int8)
+    padded[:, 1:-1] = mask
+    edges = np.diff(padded, axis=1)
+    rows, starts = np.nonzero(edges == 1)
+    _, ends = np.nonzero(edges == -1)
+
+    parent = list(range(len(rows)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    bounds = np.searchsorted(rows, np.arange(H + 1)).tolist()
+    s, e = starts.tolist(), ends.tolist()
+    for y in range(1, H):
+        i, i_end = bounds[y - 1], bounds[y]
+        j, j_end = bounds[y], bounds[y + 1]
+        while i < i_end and j < j_end:
+            if s[i] < e[j] and s[j] < e[i]:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+            if e[i] < e[j]:
+                i += 1
+            else:
+                j += 1
+    labels = np.array([find(i) for i in range(len(rows))], dtype=np.int64)
+    return rows, starts, ends, labels
+
+
+def paint_runs(shape, rows, starts, ends):
+    H, W = shape
+    acc = np.zeros((H, W + 1), np.int32)
+    np.add.at(acc, (rows, starts), 1)
+    np.add.at(acc, (rows, ends), -1)
+    return np.cumsum(acc, axis=1)[:, :W] > 0
+
+
+def bilinear(img, rows, cols):
+    """Sample a 2-D array at fractional pixel-centre coordinates (zero outside)."""
+    H, W = img.shape
+    p = np.pad(img, 1)
+    r, c = rows - 0.5 + 1, cols - 0.5 + 1
+    r0, c0 = np.floor(r), np.floor(c)
+    fr, fc = r - r0, c - c0
+    r0 = np.clip(r0.astype(np.int64), 0, H + 1)
+    c0 = np.clip(c0.astype(np.int64), 0, W + 1)
+    r1, c1 = np.minimum(r0 + 1, H + 1), np.minimum(c0 + 1, W + 1)
+    top = p[r0, c0] * (1 - fc) + p[r0, c1] * fc
+    bot = p[r1, c0] * (1 - fc) + p[r1, c1] * fc
+    return top * (1 - fr) + bot * fr
+
+
+# --------------------------------------------------------------------------
+# Master analysis: background matte, part masks, shading
+# --------------------------------------------------------------------------
+
+def remove_background(rgb, bg_tol=10 / 255, min_hole_area=20, band=2):
+    """Matte the helmet off a plain background.
+
+    Returns (alpha, foreground colours with the background unmixed, bg colour).
+    """
+    H, W, _ = rgb.shape
+    edge = np.concatenate([rgb[:4].reshape(-1, 3), rgb[-4:].reshape(-1, 3),
+                           rgb[:, :4].reshape(-1, 3), rgb[:, -4:].reshape(-1, 3)])
+    bg_color = np.median(edge, axis=0).astype(np.float32)
+    dist = np.abs(rgb - bg_color).max(-1)
+
+    # Background-coloured regions count as background if they touch the image
+    # border or are big enough to be a real see-through gap (between facemask
+    # bars, through the ear hole). Small specks are highlights on the helmet.
+    rows, starts, ends, labels = components_by_run(dist <= bg_tol)
+    _, comp = np.unique(labels, return_inverse=True)
+    size = np.bincount(comp, weights=ends - starts)
+    touches = np.bincount(comp, weights=(rows == 0) | (rows == H - 1) | (starts == 0) | (ends == W)) > 0
+    min_area = min_hole_area * (H * W) / REFERENCE_WIDTH ** 2
+    keep = (touches | (size >= min_area))[comp]
+    bg = paint_runs((H, W), rows[keep], starts[keep], ends[keep])
+
+    # Pixels next to the background are a mix of helmet and background.
+    # Estimate the pure helmet colour from nearby solid pixels, then read
+    # coverage off the line between background and that colour.
+    edge_band = dilate(bg, band) & ~bg
+    solid = ~bg & ~edge_band
+    fg_est = rgb.copy()
+    pending = edge_band.copy()
+    for sigma in (band, 4 * band):
+        ys, xs = np.nonzero(pending)
+        if len(ys) == 0:
+            break
+        r = math.ceil(3 * sigma) + 1
+        win = (slice(max(ys.min() - r, 0), ys.max() + r + 1), slice(max(xs.min() - r, 0), xs.max() + r + 1))
+        s = solid[win].astype(np.float32)
+        w = blur(s, sigma)
+        est = blur(rgb[win] * s[..., None], sigma) / np.maximum(w, 1e-6)[..., None]
+        done = pending[win] & (w >= 1e-3)
+        fg_est[win][done] = est[done]
+        pending[win] &= ~done
+
+    diff = fg_est - bg_color
+    proj = ((rgb - bg_color) * diff).sum(-1) / np.maximum((diff * diff).sum(-1), 1e-4)
+    alpha = np.where(solid, 1.0, np.where(bg, 0.0, np.clip(proj, 0.0, 1.0))).astype(np.float32)
+
+    # Remove the background's contribution from partially covered pixels so no
+    # light fringe survives the recolour.
+    unmixed = (rgb - (1 - alpha[..., None]) * bg_color) / np.maximum(alpha, 1e-3)[..., None]
+    trust = smoothstep(0.05, 0.5, alpha)[..., None]
+    fg = np.clip(trust * unmixed + (1 - trust) * fg_est, 0.0, 1.0)
+    fg = np.where(solid[..., None], rgb, fg)
+    return alpha, fg.astype(np.float32), bg_color
+
+
+def smooth_within_parts(values, weights, support, sigma):
+    out = np.zeros_like(values)
+    for k in range(weights.shape[-1]):
+        w = weights[..., k] * support
+        out += weights[..., k] * blur(values * w, sigma) / np.maximum(blur(w, sigma), 1e-6)
+    # Pixels with no paint support (pads, screws) keep their own value.
+    trust = smoothstep(0.0, 0.2, blur(support, sigma))
+    return trust * out + (1 - trust) * values
+
+
+def calibrate_hues(hue, chroma, alpha):
+    """Find the actual ID hues in the master (renders drift off pure RGB)."""
+    sel = (chroma > 0.25) & (alpha > 0.5)
+    hist = np.bincount(np.round(hue[sel]).astype(int) % 360, minlength=360).astype(np.float32)
+    hist = np.convolve(np.concatenate([hist[-5:], hist, hist[:5]]), np.ones(11) / 11, "valid")
+    centers = []
+    for nominal in ID_HUES:
+        window = (np.arange(360) - nominal + 180) % 360 - 180
+        cand = np.where(np.abs(window) <= 60, hist, -1)
+        peak = int(np.argmax(cand))
+        if cand[peak] <= 0:
+            centers.append(nominal)
+            continue
+        near = sel & (hue_distance(hue, peak) <= 15)
+        ang = np.deg2rad(hue[near])
+        centers.append(float(np.rad2deg(np.arctan2(np.sin(ang).mean(), np.cos(ang).mean())) % 360))
+    return centers
+
+
+@dataclass
+class HelmetMaps:
+    """Everything the recolour needs, in the cropped master's pixel grid."""
+    alpha: np.ndarray     # (H, W) coverage
+    weights: np.ndarray   # (H, W, 3) share of shell / stripe / facemask paint
+    paint: np.ndarray     # (H, W) 1 = team paint, 0 = neutral (pads, screws)
+    shade: np.ndarray     # (H, W) diffuse light relative to each part's base tone
+    gloss: np.ndarray     # (H, W) additive white from glossy highlights (linear)
+    neutral: np.ndarray   # (H, W) grey level for neutral pixels (linear)
+
+    def flipped(self) -> HelmetMaps:
+        return HelmetMaps(*(np.ascontiguousarray(a[:, ::-1]) for a in
+                            (self.alpha, self.weights, self.paint, self.shade, self.gloss, self.neutral)))
+
+    @property
+    def size(self):
+        return self.alpha.shape[1], self.alpha.shape[0]
+
+
+def analyse_master(path, pad=6):
+    img = Image.open(path)
+    if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
+        # Already cut out: composite on white so the same matting path applies.
+        rgba = img.convert("RGBA")
+        base = Image.new("RGBA", rgba.size, (248, 248, 248, 255))
+        img = Image.alpha_composite(base, rgba)
+    rgb = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+    scale = rgb.shape[1] / REFERENCE_WIDTH
+
+    alpha, fg, _ = remove_background(rgb)
+
+    ys, xs = np.nonzero(alpha > 0.02)
+    if len(xs) == 0:
+        raise SystemExit(f"{path}: could not find a helmet on the background")
+    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + 1 + pad, rgb.shape[1])
+    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + 1 + pad, rgb.shape[0])
+    alpha, fg = alpha[y0:y1, x0:x1], fg[y0:y1, x0:x1]
+
+    # --- which part is each pixel? (hue, softened spatially) -----------------
+    hue = hue_degrees(fg)
+    mx, mn = fg.max(-1), fg.min(-1)
+    chroma = mx - mn
+    sat = chroma / np.maximum(mx, 1e-4)
+    centers = calibrate_hues(hue, chroma, alpha)
+    score = np.stack([np.exp(-(hue_distance(hue, c) / 20.0) ** 2) for c in centers], -1)
+    weights = score / np.maximum(score.sum(-1, keepdims=True), 1e-12)
+    weights = blur(weights, 0.9 * scale)
+    weights /= np.maximum(weights.sum(-1, keepdims=True), 1e-6)
+
+    # Team paint vs neutral parts (dark padding, metal screws). Colourful or
+    # saturated-and-not-black pixels are paint.
+    paint = np.maximum(smoothstep(0.05, 0.16, chroma),
+                       smoothstep(0.18, 0.40, sat) * smoothstep(0.03, 0.10, mx))
+    paint = blur(paint, 0.7 * scale)
+
+    # --- shading: pixel ~ shade * base_colour + gloss * white ----------------
+    lin = srgb_to_linear(fg)
+    core = alpha > 0.99
+    base = []
+    for k in range(3):
+        sel = core & (weights[..., k] > 0.95) & (paint > 0.95)
+        if sel.sum() < 50:
+            raise SystemExit(f"{path}: no {PARTS[k]} pixels found (expected hue near {ID_HUES[k]:.0f} deg)")
+        base.append(np.median(lin[sel], axis=0))
+    base = np.array(base, dtype=np.float32)              # (3 parts, rgb)
+
+    albedo = weights @ base                              # expected ID colour per pixel
+    aa = (albedo * albedo).sum(-1)
+    a1 = albedo.sum(-1)
+    ac = (albedo * lin).sum(-1)
+    c1 = lin.sum(-1)
+    det = np.maximum(3 * aa - a1 * a1, 1e-8)
+    shade = (3 * ac - a1 * c1) / det
+    gloss = (aa * c1 - a1 * ac) / det
+    no_gloss = gloss < 0                                 # least squares with gloss >= 0
+    shade = np.where(no_gloss, ac / np.maximum(aa, 1e-8), shade)
+    gloss = np.where(no_gloss, 0.0, gloss)
+    no_shade = shade < 0
+    gloss = np.where(no_shade, c1 / 3, gloss)
+    shade = np.maximum(shade, 0.0)
+
+    # The render's surface grain (and any compression noise) lives in the
+    # shading. Smooth it lightly, never across a part boundary, so light
+    # team colours don't come out blotchy.
+    support = alpha * paint
+    shade = smooth_within_parts(shade, weights, support, 1.0 * scale)
+    gloss = smooth_within_parts(gloss, weights, support, 0.5 * scale)
+
+    neutral = lin @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+    maps = HelmetMaps(alpha, weights.astype(np.float32), paint.astype(np.float32),
+                      shade.astype(np.float32), gloss.astype(np.float32), neutral.astype(np.float32))
+    info = {"crop": (x0, y0, x1, y1), "scale": scale, "hues": centers,
+            "base": [to_hex(np.round(linear_to_srgb(b) * 255).astype(int)) for b in base]}
+    return maps, info
+
+
+# --------------------------------------------------------------------------
+# Lettering
+# --------------------------------------------------------------------------
+
+def load_font(font_path, size):
+    try:
+        return ImageFont.truetype(str(font_path), size)
+    except OSError as exc:
+        raise SystemExit(f"could not load font {font_path}: {exc}")
+
+
+def render_lettering(text, font_path, layout: TextLayout, ss=4):
+    """Flat lettering mask at `ss` x master scale, fitted to the layout.
+
+    Returns (mask, centre column, centre row) in mask pixels.
+    """
+    probe = load_font(font_path, 200)
+    cap_ratio = -probe.getbbox("H", anchor="ls")[1] / 200.0
+
+    def natural_width(cap):
+        f = load_font(font_path, max(1, round(cap / cap_ratio)))
+        l, _, r, _ = f.getbbox(text, anchor="ls")
+        return (r - l) + layout.tracking * cap * (len(text) - 1)
+
+    cap = layout.cap_height
+    width = natural_width(cap)
+    squeeze = 1.0
+    if width > layout.max_width:
+        squeeze = max(layout.min_squeeze, layout.max_width / width)
+        if width * squeeze > layout.max_width:
+            cap *= layout.max_width / (width * squeeze)
+
+    font = load_font(font_path, max(1, round(cap * ss / cap_ratio)))
+    cap_ss = cap_ratio * font.size
+    track = layout.tracking * cap * ss
+    pad = int(cap_ss * 0.6) + 4
+    advance = [font.getlength(text[:i]) + i * track for i in range(len(text) + 1)]
+    W = int(math.ceil(advance[-1])) + 2 * pad
+    H = int(math.ceil(cap_ss)) + 2 * pad
+    canvas = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(canvas)
+    baseline = pad + cap_ss
+    for i, ch in enumerate(text):
+        draw.text((pad + advance[i], baseline), ch, font=font, fill=255, anchor="ls")
+
+    ink = canvas.getbbox()
+    if ink is None:
+        raise SystemExit(f"font {font_path} rendered nothing for {text!r}")
+    if squeeze != 1.0:
+        canvas = canvas.resize((max(1, round(W * squeeze)), H), Image.LANCZOS)
+    cx = (ink[0] + ink[2]) / 2 * squeeze
+    cy = baseline - cap_ss / 2
+    return np.asarray(canvas, dtype=np.float32) / 255.0, cx, cy
+
+
+def place_lettering(mask, mcx, mcy, ss, layout: TextLayout, shape, q=3):
+    """Warp the flat lettering onto an arc + tilt at layout.center.
+
+    Returns a coverage map of `shape`. The arc bulges upward like the shell.
+    """
+    H, W = shape
+    out = np.zeros(shape, np.float32)
+    mh, mw = mask.shape
+    reach = max(math.hypot(x - mcx, y - mcy) for x in (0, mw) for y in (0, mh)) / ss + 2
+    cx, cy = layout.center
+    x0, x1 = max(int(cx - reach), 0), min(int(cx + reach) + 1, W)
+    y0, y1 = max(int(cy - reach), 0), min(int(cy + reach) + 1, H)
+    if x0 >= x1 or y0 >= y1:
+        return out
+    ys, xs = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+    t = math.radians(layout.tilt_deg)
+    ct, st = math.cos(t), math.sin(t)
+    R = layout.arc_radius
+    acc = np.zeros(ys.shape, np.float32)
+    for oy in range(q):
+        for ox in range(q):
+            px = xs + (ox + 0.5) / q - cx
+            py = ys + (oy + 0.5) / q - cy
+            u = px * ct - py * st            # along the lettering
+            v = px * st + py * ct            # down, across the lettering
+            up = R - v                       # arc centre sits R below the text
+            along = R * np.arctan2(u, up)
+            height = np.hypot(u, up) - R
+            acc += bilinear(mask, mcy - height * ss, mcx + along * ss)
+    out[y0:y1, x0:x1] = np.clip(acc / (q * q), 0.0, 1.0)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+def shoulder(rgb, knee=0.8):
+    """Soft roll-off above `knee` (linear light) so bright team colours keep
+    their shading instead of flattening to pure white. Hue-preserving."""
+    m = rgb.max(-1, keepdims=True)
+    rolled = knee + (1.0 - knee) * np.tanh((m - knee) / (1.0 - knee))
+    return rgb * np.where(m > knee, rolled / np.maximum(m, 1e-6), 1.0)
+
+
+def compress_highlights(rgb):
+    """Bring overexposed highlights back into range by fading them to white
+    instead of clipping each channel (which would shift the hue)."""
+    m = rgb.max(-1, keepdims=True)
+    over = np.maximum(m, 1.0)
+    scaled = rgb / over
+    return scaled + (1.0 - scaled) * (1.0 - 1.0 / over)
+
+
+def render_helmet(maps: HelmetMaps, colors, text_color=None, lettering=None):
+    team = srgb_to_linear(np.asarray(colors, dtype=np.float32) / 255.0)    # (3, 3)
+    albedo = maps.weights @ team
+    if lettering is not None:
+        cover = (lettering * maps.weights[..., 0])[..., None]                  # on the shell only
+        letter = srgb_to_linear(np.asarray(text_color, dtype=np.float32) / 255.0)
+        albedo = albedo + cover * (letter - team[0])
+    lit = compress_highlights(shoulder(maps.shade[..., None] * albedo) + maps.gloss[..., None])
+    paint = maps.paint[..., None]
+    out = paint * lit + (1.0 - paint) * maps.neutral[..., None]
+    rgb8 = np.round(linear_to_srgb(out) * 255).astype(np.uint8)
+    a8 = np.round(np.clip(maps.alpha, 0, 1) * 255).astype(np.uint8)
+    return Image.fromarray(np.dstack([rgb8, a8]), "RGBA")
+
+
+def fit_to_canvas(img: Image.Image, size: int, margin: float):
+    """Scale the helmet crop into a square canvas, centred. Every output uses
+    the same crop size, so position and scale are identical across files."""
+    w, h = img.size
+    f = size * (1 - 2 * margin) / max(w, h)
+    nw, nh = max(1, round(w * f)), max(1, round(h * f))
+    small = img.convert("RGBa").resize((nw, nh), Image.LANCZOS).convert("RGBA")
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.paste(small, ((size - nw) // 2, (size - nh) // 2))
+    return canvas
+
+
+def slugify(city: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", city).strip("_") or "team"
+
+
+# --------------------------------------------------------------------------
+# Contact sheet
+# --------------------------------------------------------------------------
+
+def contact_sheet(entries, path, font_path, thumb=300):
+    n = len(entries)
+    cols = max(1, math.ceil(math.sqrt(n / 2)))
+    rows = math.ceil(n / cols)
+    gap, label_h = 16, 78
+    cell_w, cell_h = 2 * thumb + gap, thumb + label_h
+    W = cols * cell_w + (cols + 1) * gap
+    H = rows * cell_h + (rows + 1) * gap
+    sheet = Image.new("RGB", (W, H), (24, 27, 34))
+    draw = ImageDraw.Draw(sheet)
+    title_font = load_font(font_path, 26)
+    small_font = load_font(font_path, 15)
+
+    # Checkerboard behind each helmet so transparency and fringes show up.
+    tile = 12
+    yy, xx = np.mgrid[0:thumb, 0:thumb]
+    check = np.where(((yy // tile + xx // tile) % 2)[..., None] == 0, (58, 62, 72), (72, 77, 89)).astype(np.uint8)
+    checker = Image.fromarray(check, "RGB")
+
+    for i, (team, right, left) in enumerate(entries):
+        cx = gap + (i % cols) * (cell_w + gap)
+        cy = gap + (i // cols) * (cell_h + gap)
+        for j, img in enumerate((right, left)):
+            x = cx + j * (thumb + gap)
+            sheet.paste(checker, (x, cy))
+            t = img.convert("RGBa").resize((thumb, thumb), Image.LANCZOS).convert("RGBA")
+            sheet.paste(t, (x, cy), t)
+        ty = cy + thumb + 6
+        draw.text((cx, ty), team["city"], font=title_font, fill=(240, 240, 240))
+        sx, sy = cx, ty + 44
+        swatches = [("shell", team["shell"]), ("stripe", team["stripe"]), ("mask", team["facemask"])]
+        if team["text"]:
+            swatches.append(("text", team["text_color"]))
+        for label, rgb in swatches:
+            draw.rectangle((sx, sy, sx + 18, sy + 18), fill=tuple(rgb), outline=(140, 140, 150))
+            draw.text((sx + 25, sy + 9), label, font=small_font, fill=(150, 155, 165), anchor="lm")
+            hx = sx + 25 + int(draw.textlength(label, font=small_font)) + 6
+            draw.text((hx, sy + 9), to_hex(rgb), font=small_font, fill=(225, 227, 232), anchor="lm")
+            sx = hx + int(draw.textlength("#000000", font=small_font)) + 22
+    sheet.save(path)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def read_teams(path: Path):
+    teams = []
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        fields = {f.strip().lower(): f for f in (reader.fieldnames or [])}
+        missing = [c for c in ("city", "shell_hex", "stripe_hex", "facemask_hex") if c not in fields]
+        if missing:
+            raise SystemExit(f"{path}: missing column(s): {', '.join(missing)}")
+        for line, row in enumerate(reader, start=2):
+            get = lambda key: (row.get(fields.get(key, ""), "") or "").strip()
+            if not any((v or "").strip() for v in row.values()):
+                continue
+            city = get("city")
+            if not city:
+                raise SystemExit(f"{path}:{line}: empty city")
+            try:
+                team = {"city": city,
+                        "shell": parse_hex(get("shell_hex")),
+                        "stripe": parse_hex(get("stripe_hex")),
+                        "facemask": parse_hex(get("facemask_hex"))}
+                # Text only when the CSV asks for it, exactly as written.
+                team["text"] = get("text")
+                team["text_color"] = None
+                if team["text"]:
+                    team["text_color"] = (parse_hex(get("text_hex")) if get("text_hex")
+                                          else pick_text_color(team["shell"], team["stripe"], team["facemask"]))
+            except ValueError as exc:
+                raise SystemExit(f"{path}:{line}: {exc}")
+            teams.append(team)
+    if not teams:
+        raise SystemExit(f"{path}: no teams found")
+    return teams
+
+
+def save_debug(maps: HelmetMaps, path: Path):
+    """Side-by-side view of the masks: matte | part weights | paint gate | shade/gloss."""
+    a = maps.alpha
+    parts = np.dstack([maps.weights[..., 0], maps.weights[..., 1], maps.weights[..., 2]]) * maps.paint[..., None]
+    paint = np.repeat(maps.paint[..., None], 3, -1)
+    shading = np.dstack([np.clip(maps.shade / 2, 0, 1), np.clip(maps.gloss * 2, 0, 1), np.zeros_like(a)])
+    panels = [np.repeat(a[..., None], 3, -1), parts * a[..., None], paint * a[..., None], shading * a[..., None]]
+    Image.fromarray(np.round(np.concatenate(panels, 1) * 255).astype(np.uint8)).save(path)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--master", type=Path, default=HERE / "master_helmet.png")
+    ap.add_argument("--teams", type=Path, default=HERE / "teams.csv")
+    ap.add_argument("--out", type=Path, default=HERE / "output")
+    ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Oswald-Bold.ttf",
+                    help="bold condensed TTF/OTF for the helmet text")
+    ap.add_argument("--size", type=int, default=1024, help="square canvas size in px (default 1024)")
+    ap.add_argument("--margin", type=float, default=0.04, help="empty border, fraction of the canvas")
+    ap.add_argument("--no-preview", action="store_true", help="skip preview.png")
+    ap.add_argument("--debug", action="store_true", help="also write debug_masks.png")
+    args = ap.parse_args(argv)
+
+    teams = read_teams(args.teams)
+    print(f"analysing {args.master} ...")
+    maps_right, info = analyse_master(args.master)
+    maps_left = maps_right.flipped()
+    x0, y0, _, _ = info["crop"]
+    crop_w, _ = maps_right.size
+    layout_right = TextLayout().scaled(info["scale"]).shifted(-x0, -y0)
+    layout_left = layout_right.mirrored(crop_w)
+    print("  ID hues (deg): " + ", ".join(f"{p}={h:.0f}" for p, h in zip(PARTS, info["hues"])))
+    print("  base tones:    " + ", ".join(f"{p}={c}" for p, c in zip(PARTS, info["base"])))
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    if args.debug:
+        save_debug(maps_right, args.out / "debug_masks.png")
+
+    ss = 4
+    entries, seen = [], {}
+    for team in teams:
+        slug = slugify(team["city"])
+        if slug in seen:
+            print(f"  warning: {team['city']!r} overwrites {seen[slug]!r} ({slug}_*.png)", file=sys.stderr)
+        seen[slug] = team["city"]
+        colors = (team["shell"], team["stripe"], team["facemask"])
+        lettering = None
+        if team["text"]:
+            lettering = render_lettering(team["text"], args.font, layout_right, ss=ss)
+
+        outputs = {}
+        for side, maps, layout in (("right", maps_right, layout_right), ("left", maps_left, layout_left)):
+            # The left helmet is the flipped render; its lettering is warped
+            # onto the flipped shell afterwards, so it always reads normally.
+            letters = None
+            if lettering is not None:
+                mask, mcx, mcy = lettering
+                letters = place_lettering(mask, mcx, mcy, ss, layout, maps.alpha.shape)
+            img = render_helmet(maps, colors, team["text_color"], letters)
+            img = fit_to_canvas(img, args.size, args.margin)
+            img.save(args.out / f"{slug}_{side}.png")
+            outputs[side] = img
+        entries.append((team, outputs["right"], outputs["left"]))
+        text_note = f", text {team['text']!r} {to_hex(team['text_color'])}" if team["text"] else ", no text"
+        print(f"  {team['city']}: shell {to_hex(team['shell'])}, stripe {to_hex(team['stripe'])}, "
+              f"facemask {to_hex(team['facemask'])}{text_note} -> {slug}_right/left.png")
+
+    if not args.no_preview:
+        contact_sheet(entries, args.out / "preview.png", args.font)
+        print(f"wrote {args.out / 'preview.png'}")
+
+
+if __name__ == "__main__":
+    main()
