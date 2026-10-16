@@ -26,6 +26,7 @@ Every file has the same canvas size, position and scale (default 1024×1024, `--
 | `text` | no | text for the side of the shell, drawn big and exactly as written (made for 3 letters like `BUF`; longer text shrinks to fit). Leave blank for no text. |
 | `text_hex` | no | text color. If blank, the most contrasting of stripe/facemask is used, or white/black. |
 | `outline_hex` | no | outline around the letters. Leave blank for no outline. |
+| `text_style` | no | `flat` (default) or `3d`: wraps the text around the shell so it curves and foreshortens like a real decal. |
 
 Hex values can be `#RRGGBB`, `RRGGBB` or `#RGB`.
 

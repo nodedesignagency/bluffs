@@ -58,6 +58,10 @@ class TextLayout:
     tracking: float = 0.04       # extra letter spacing, fraction of cap height
     min_squeeze: float = 0.82    # condense this far before shrinking the size
     outline: float = 0.05        # outline thickness (if used), fraction of cap height
+    # "3d" text style: the shell is modelled as a sphere fitted to its outline
+    # and the text is wrapped onto it like a decal.
+    sphere_center: tuple[float, float] = (671.0, 663.0)
+    sphere_radius: float = 463.0
 
     def scaled(self, k: float) -> TextLayout:
         return replace(
@@ -66,15 +70,19 @@ class TextLayout:
             max_width=self.max_width * k,
             cap_height=self.cap_height * k,
             arc_radius=self.arc_radius * k,
+            sphere_center=(self.sphere_center[0] * k, self.sphere_center[1] * k),
+            sphere_radius=self.sphere_radius * k,
         )
 
     def shifted(self, dx: float, dy: float) -> TextLayout:
-        return replace(self, center=(self.center[0] + dx, self.center[1] + dy))
+        return replace(self, center=(self.center[0] + dx, self.center[1] + dy),
+                       sphere_center=(self.sphere_center[0] + dx, self.sphere_center[1] + dy))
 
     def mirrored(self, width: float) -> TextLayout:
         """Same spot on the flipped helmet. The geometry is mirrored, the
         letters are not: they are drawn fresh, reading left to right."""
-        return replace(self, center=(width - self.center[0], self.center[1]), tilt_deg=-self.tilt_deg)
+        return replace(self, center=(width - self.center[0], self.center[1]), tilt_deg=-self.tilt_deg,
+                       sphere_center=(width - self.sphere_center[0], self.sphere_center[1]))
 
 
 # --------------------------------------------------------------------------
@@ -495,10 +503,32 @@ def render_lettering(text, font_path, layout: TextLayout, ss=4, outline=False):
     return masks[0], (masks[1] if outline else None), cx, cy
 
 
-def place_lettering(mask, mcx, mcy, ss, layout: TextLayout, shape, q=3):
-    """Warp the flat lettering onto an arc + tilt at layout.center.
+TEXT_STYLES = ("flat", "3d")
+# The sphere wrap already lifts the text toward the front and foreshortens it,
+# so the 3d style drops the extra tilt and uses slightly taller letters.
+STYLE_OVERRIDES = {"flat": {}, "3d": {"tilt_deg": 0.0, "cap_height": 220.0}}
 
-    Returns a coverage map of `shape`. The arc bulges upward like the shell.
+
+def sphere_frame(layout: TextLayout):
+    """Unit vectors at the text centre on the shell sphere: surface normal,
+    text direction (tilted) and text-down direction."""
+    (cx, cy), r = layout.sphere_center, layout.sphere_radius
+    ax, ay = (layout.center[0] - cx) / r, (layout.center[1] - cy) / r
+    normal = np.array([ax, ay, math.sqrt(max(1.0 - ax * ax - ay * ay, 1e-6))])
+    t = math.radians(layout.tilt_deg)
+    along = np.array([math.cos(t), -math.sin(t), 0.0])
+    along -= (along @ normal) * normal
+    along /= np.linalg.norm(along)
+    return normal, along, np.cross(normal, along)
+
+
+def place_lettering(mask, mcx, mcy, ss, layout: TextLayout, shape, q=3, style="flat"):
+    """Warp the flat text masks onto the shell at layout.center.
+
+    flat: a gentle arc (bulging upward like the shell) plus tilt.
+    3d:   wrapped onto a sphere fitted to the shell, so the letters curve and
+          foreshorten as the shell turns away, like a real decal.
+    Returns a coverage map of `shape`.
     """
     H, W = shape
     out = np.zeros(shape, np.float32)
@@ -513,17 +543,34 @@ def place_lettering(mask, mcx, mcy, ss, layout: TextLayout, shape, q=3):
     t = math.radians(layout.tilt_deg)
     ct, st = math.cos(t), math.sin(t)
     R = layout.arc_radius
+    if style == "3d":
+        normal, e_along, e_down = sphere_frame(layout)
+        (scx, scy), sr = layout.sphere_center, layout.sphere_radius
     acc = np.zeros(ys.shape, np.float32)
     for oy in range(q):
         for ox in range(q):
-            px = xs + (ox + 0.5) / q - cx
-            py = ys + (oy + 0.5) / q - cy
-            u = px * ct - py * st            # along the lettering
-            v = px * st + py * ct            # down, across the lettering
-            up = R - v                       # arc centre sits R below the text
-            along = R * np.arctan2(u, up)
-            height = np.hypot(u, up) - R
-            acc += bilinear(mask, mcy - height * ss, mcx + along * ss)
+            px = xs + (ox + 0.5) / q
+            py = ys + (oy + 0.5) / q
+            if style == "3d":
+                # Point on the sphere under this pixel, then its geodesic
+                # offset from the text centre (azimuthal equidistant), in px.
+                X, Y = (px - scx) / sr, (py - scy) / sr
+                Z = np.sqrt(np.clip(1.0 - X * X - Y * Y, 0.0, None))
+                cos_d = np.clip(X * normal[0] + Y * normal[1] + Z * normal[2], -1.0, 1.0)
+                qx, qy, qz = X - cos_d * normal[0], Y - cos_d * normal[1], Z - cos_d * normal[2]
+                qn = np.sqrt(qx * qx + qy * qy + qz * qz)
+                k = np.where(qn > 1e-7, np.arccos(cos_d) / np.maximum(qn, 1e-7), 1.0) * sr
+                along = (qx * e_along[0] + qy * e_along[1] + qz * e_along[2]) * k
+                down = (qx * e_down[0] + qy * e_down[1] + qz * e_down[2]) * k
+                visible = (X * X + Y * Y < 1.0) & (cos_d > 0.0)
+                acc += bilinear(mask, mcy + down * ss, mcx + along * ss) * visible
+            else:
+                u = (px - cx) * ct - (py - cy) * st       # along the lettering
+                v = (px - cx) * st + (py - cy) * ct       # down, across the lettering
+                up = R - v                                # arc centre sits R below the text
+                along = R * np.arctan2(u, up)
+                height = np.hypot(u, up) - R
+                acc += bilinear(mask, mcy - height * ss, mcx + along * ss)
     out[y0:y1, x0:x1] = np.clip(acc / (q * q), 0.0, 1.0)
     return out
 
@@ -674,6 +721,10 @@ def read_teams(path: Path):
                                           else pick_text_color(team["shell"], team["stripe"], team["facemask"]))
                     if get("outline_hex"):
                         team["outline"] = parse_hex(get("outline_hex"))
+                team["text_style"] = get("text_style").lower() or "flat"
+                if team["text_style"] not in TEXT_STYLES:
+                    raise ValueError(f"text_style must be one of {', '.join(TEXT_STYLES)}, "
+                                     f"got {get('text_style')!r}")
             except ValueError as exc:
                 raise SystemExit(f"{path}:{line}: {exc}")
             teams.append(team)
@@ -711,8 +762,10 @@ def main(argv=None):
     maps_left = maps_right.flipped()
     x0, y0, _, _ = info["crop"]
     crop_w, _ = maps_right.size
-    layout_right = TextLayout().scaled(info["scale"]).shifted(-x0, -y0)
-    layout_left = layout_right.mirrored(crop_w)
+    layouts = {}
+    for style, overrides in STYLE_OVERRIDES.items():
+        right = replace(TextLayout(), **overrides).scaled(info["scale"]).shifted(-x0, -y0)
+        layouts[style] = (right, right.mirrored(crop_w))
     print("  ID hues (deg): " + ", ".join(f"{p}={h:.0f}" for p, h in zip(PARTS, info["hues"])))
     print("  base tones:    " + ", ".join(f"{p}={c}" for p, c in zip(PARTS, info["base"])))
 
@@ -728,6 +781,7 @@ def main(argv=None):
             print(f"  warning: {team['city']!r} overwrites {seen[slug]!r} ({slug}_*.png)", file=sys.stderr)
         seen[slug] = team["city"]
         colors = (team["shell"], team["stripe"], team["facemask"])
+        layout_right, layout_left = layouts[team["text_style"]]
         lettering = None
         if team["text"]:
             lettering = render_lettering(team["text"], args.font, layout_right, ss=ss,
@@ -740,9 +794,10 @@ def main(argv=None):
             fill = outer = None
             if lettering is not None:
                 fill_mask, outer_mask, mcx, mcy = lettering
-                fill = place_lettering(fill_mask, mcx, mcy, ss, layout, maps.alpha.shape)
+                style = team["text_style"]
+                fill = place_lettering(fill_mask, mcx, mcy, ss, layout, maps.alpha.shape, style=style)
                 if outer_mask is not None:
-                    outer = place_lettering(outer_mask, mcx, mcy, ss, layout, maps.alpha.shape)
+                    outer = place_lettering(outer_mask, mcx, mcy, ss, layout, maps.alpha.shape, style=style)
             img = render_helmet(maps, colors, team["text_color"], fill, team["outline"], outer)
             img = fit_to_canvas(img, args.size, args.margin)
             img.save(args.out / f"{slug}_{side}.png")
@@ -751,6 +806,8 @@ def main(argv=None):
         text_note = f", text {team['text']!r} {to_hex(team['text_color'])}" if team["text"] else ", no text"
         if team["outline"]:
             text_note += f" outline {to_hex(team['outline'])}"
+        if team["text"] and team["text_style"] != "flat":
+            text_note += f" ({team['text_style']})"
         print(f"  {team['city']}: shell {to_hex(team['shell'])}, stripe {to_hex(team['stripe'])}, "
               f"facemask {to_hex(team['facemask'])}{text_note} -> {slug}_right/left.png")
 
