@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""Generate team-coloured basketballs from one ID-coloured master render.
+"""Generate team-coloured basketballs from one master render.
 
-The master image is a glossy, front-facing basketball on a light background,
-painted with ID colours:
+The master image is a matte, pebbled, solid red basketball with black seams on
+a white background. For every row of the balls CSV (abbr, ball_hex, plus
+optional team, text_hex and outline_hex) this writes
 
-    red = ball surface        blue = seams
+    <out>/<ABBR>.png      transparent PNG, same canvas, size and position for all
+    <out>/preview.png     grid of every ball on the app's dark card colour
 
-For every row of the balls CSV (city, abbr, primary_hex, secondary_hex, plus
-optional seam_hex, text_hex and outline_hex) this writes
-
-    <out>/<City>.png      transparent PNG, same canvas, size and position for all
-    <out>/preview.png     contact sheet with every team
-
-The ball takes the primary colour with the master's gloss and shading; the
-seams default to the primary 35% darker. The abbreviation sits on the
-horizontal seam, nudged left of centre to clear the vertical seam, wrapped
-around the ball in a chunky rounded font: secondary fill, thin darker outline
-and a soft inner shadow so it reads as printed. The master's soft edge glow is
-trimmed off and replaced by a rim glow in the team colour. Leave abbr blank
-for no text. Shares the recolouring code with make_helmets.py.
+The red takes the team colour with the master's shading and pebble texture
+kept; the black seams are left as they are. The abbreviation is printed big
+across the middle seam: a bold condensed block font in off-white with a
+subtle top-to-bottom gradient, a thin outline in a darker shade of the ball
+colour, wrapped onto the sphere, with the pebble texture multiplied over it
+and a soft inner shadow so it reads as printed on the rubber. The master's
+faint pink edge halo is trimmed off.
 
     python make_balls.py
     python make_balls.py --teams balls.csv --out output/balls --size 1024
@@ -33,34 +29,33 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
 from make_helmets import (
     HERE, TextLayout, analyse_master, blur, components_by_run, compress_highlights, contact_sheet,
-    dilate, fit_to_canvas, linear_to_srgb, paint_runs, parse_hex, place_lettering, render_lettering,
-    shoulder, slugify, smoothstep, srgb_to_linear, to_hex,
+    dilate, fit_to_canvas, grow_distance, linear_to_srgb, load_font, paint_runs, parse_hex,
+    place_lettering, shoulder, slugify, smoothstep, srgb_to_linear, to_hex,
 )
 
-ID_HUES = (0.0, 240.0)               # red ball, blue seams
-PART_NAMES = ("ball", "seam")
+EDGE_ERODE = 2                   # px trimmed off the master's edge (removes the pink halo)
+EDGE_FEATHER = 1.0               # px, softness of the new edge
 
-SEAM_DARKEN = 0.35                   # default seam = primary this much darker
-EDGE_ERODE = 3                       # px trimmed off the master's edge (removes its glow)
-EDGE_FEATHER = 1.0                   # px, softness of the new edge
+TEXT_CAP = 0.35                  # cap height, fraction of the ball's height
+TEXT_WIDTH = 0.75                # text width, fraction of the ball's width
+STRETCH_LIMITS = (0.7, 1.7)      # how far the font may be widened or narrowed to hit TEXT_WIDTH
+TEXT_TRACKING = 0.05             # letter spacing, fraction of cap height
+BULGE_RADIUS = 1.25              # sphere the text wraps on, x ball radius (1 = full curve, larger = flatter)
 
-TEXT_CAP = 0.36                      # starting cap height, fraction of ball radius
-TEXT_MIN_SHIFT = 0.05                # always nudge the text at least this far left (x radius)
-TEXT_MARGIN = 0.03                   # clearance from other seams and the rim (x radius)
-TEXT_OUTLINE = 0.045                 # outline thickness, fraction of cap height
-TEXT_TRACKING = 0.02
-INNER_SHADOW = 0.45                  # darkening at the shadowed inner edge of the letters
-INNER_SHADOW_OFFSET = 0.045          # fraction of cap height, towards bottom-right (light is top-left)
-INNER_SHADOW_SOFTNESS = 0.06         # blur, fraction of cap height
-TEXT_GLOSS_CUT = 0.25                # the gloss mostly carries over the print
-PRINT_SMOOTH = 0.015                 # how far (x image width) to borrow ball shading across the seam
+TEXT_FILL = (0xF2, 0xF2, 0xEE)
+FILL_GRADIENT = 0.05             # top this much lighter, bottom this much darker
+OUTLINE_PX = 3.0                 # outline width in output pixels at the default 1024 canvas
+OUTLINE_DARKEN = 0.45            # outline = ball colour this much darker
+TEXTURE_AMOUNT = 0.20            # pebble texture multiplied over the print
+INNER_SHADOW = 0.35              # darkening along the top inner edge (pressed in, light from above)
+INNER_SHADOW_OFFSET = 0.035      # fraction of cap height
+INNER_SHADOW_SOFTNESS = 0.05     # fraction of cap height
 
-GLOW_STRENGTH = 0.85                 # rim glow opacity at the ball's edge is about half of this
-GLOW_SIZE = 0.014                    # glow blur, fraction of the canvas size
+PREVIEW_BG = (0x1A, 0x1A, 0x22)
 
 
 def darker(rgb, amount):
@@ -77,128 +72,160 @@ def fill_holes(mask):
     return mask | paint_runs(mask.shape, rows[hole], starts[hole], ends[hole])
 
 
-def ball_matte(maps):
-    """New alpha from the ball's saturated paint only (drops the soft glow the
-    master has around its edge), eroded a little and feathered."""
-    core = fill_holes((maps.alpha > 0.5) & (maps.paint > 0.5))
-    core = ~dilate(~core, EDGE_ERODE)
-    return np.clip(blur(core.astype(np.float32), EDGE_FEATHER), 0.0, 1.0) * maps.alpha
-
-
-def fit_circle(alpha):
-    solid = alpha > 0.5
-    ys, xs = np.nonzero(solid & dilate(~solid, 1))
+def fit_circle(mask):
+    ys, xs = np.nonzero(mask & dilate(~mask, 1))
     A = np.c_[2 * xs, 2 * ys, np.ones(len(xs))]
     cx, cy, c = np.linalg.lstsq(A, xs ** 2 + ys ** 2, rcond=None)[0]
     return float(cx), float(cy), float(math.sqrt(c + cx * cx + cy * cy))
 
 
-class BallText:
-    """Finds the horizontal seam and the vertical seam on the right, and fits
-    the abbreviation between them."""
+class Ball:
+    """Everything derived from the master once: matte, paint/seam split,
+    shading, pebble texture and the ball's geometry."""
 
-    def __init__(self, maps, alpha, font):
-        self.font = font
-        self.shape = alpha.shape
-        cx, cy, r = fit_circle(alpha)
-        self.cx, self.cy, self.r = cx, cy, r
-        H, W = self.shape
-        ys, xs = np.mgrid[0:H, 0:W]
-        seam = (alpha > 0.5) & (maps.weights[..., 1] > 0.5)
+    def __init__(self, path):
+        self.maps, info = analyse_master(path, smooth_shading=False, id_hues=(0.0,), part_names=("ball",))
+        x0, y0, x1, y1 = info["crop"]
+        self.crop_size = (x1 - x0, y1 - y0)
+        rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)[y0:y1, x0:x1] / 255.0
+        mx, mn = rgb.max(-1), rgb.min(-1)
+        sat = (mx - mn) / np.maximum(mx, 1e-4)
 
-        # Horizontal seam: the row band near the centre with the most seam.
-        rows = np.arange(H)
-        near = np.abs(rows - cy) < 0.3 * r
-        count = (seam & (np.abs(xs - cx) < 0.5 * r)).sum(1) * near
+        # Matte: the solid ball with holes filled, eroded and feathered so the
+        # master's pink halo goes.
+        solid = fill_holes(self.maps.alpha > 0.5)
+        core = ~dilate(~solid, EDGE_ERODE)
+        self.alpha = np.clip(blur(core.astype(np.float32), EDGE_FEATHER), 0.0, 1.0)
+
+        # Seams are dark and grey; everything else is ball, including the
+        # washed-out, nearly white top.
+        seam = smoothstep(0.25, 0.12, sat) * smoothstep(0.62, 0.48, mx)
+        self.paint = np.clip(blur(1.0 - seam, 0.7), 0.0, 1.0)
+        self.seam = (seam > 0.5) & solid
+
+        self.cx, self.cy, self.r = fit_circle(core)
+        # Middle seam: the band of seam rows closest to the centre.
+        H, W = core.shape
+        cols = slice(int(self.cx - 0.3 * self.r), int(self.cx + 0.3 * self.r))
+        count = self.seam[:, cols].sum(1).astype(float)
+        count[np.abs(np.arange(H) - self.cy) > 0.2 * self.r] = 0
         band = np.nonzero(count > 0.6 * count.max())[0]
         self.seam_y = float(band.mean())
-        half = (band.max() - band.min()) / 2 + 3
+        self.seam_thickness = int(band.max() - band.min() + 1)
 
-        # Vertical seam on the right, just above and below the horizontal one.
-        probe = (np.abs(np.abs(ys - self.seam_y) - (half + 0.08 * r)) < 3) & (xs > cx) & seam
-        self.seam_x = float(xs[probe].min()) if probe.any() else cx + 0.6 * r
+        self.texture = self._pebble_texture(rgb, solid)
 
-        # Text may not touch any other seam, nor come near the rim.
-        self.margin = TEXT_MARGIN * r
-        other = seam & (np.abs(ys - self.seam_y) > half)
-        rim = np.hypot(xs - cx, ys - cy) > r - self.margin
-        self.forbidden = dilate(other, max(1, round(self.margin))) | rim
+    def _pebble_texture(self, rgb, solid):
+        """Pebble detail in 0..1 (1 = pebble tops), with the seams filled in
+        from just above so no seam shows through the print."""
+        lum = rgb @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        ball = (solid & ~self.seam).astype(np.float32)
+        sigma = 4.0 * self.r / 555.0
+        local = blur(lum * ball, sigma) / np.maximum(blur(ball, sigma), 1e-6)
+        ratio = np.where(ball > 0, lum / np.maximum(local, 1e-4), 1.0)
+        tex = np.clip(ratio / np.percentile(ratio[ball > 0], 95), 0.0, 1.0)
+        # Replace the seams (and their raised lips) with a block of pebbles
+        # copied from far enough above, so the copy keeps its structure.
+        lip = max(2, round(5 * self.r / 555.0))
+        hidden = dilate(self.seam, lip) & solid
+        step = self.seam_thickness + 2 * lip + 4
+        pending = hidden.copy()
+        source_ok = solid & ~hidden
+        for m in range(1, 12):
+            if not pending.any():
+                break
+            k = m * step
+            shifted = np.ones_like(tex)
+            shifted[k:] = tex[:-k]
+            ok = np.zeros_like(pending)
+            ok[k:] = source_ok[:-k]
+            take = pending & ok
+            tex[take] = shifted[take]
+            pending &= ~take
+        tex[pending] = 1.0
+        return tex
 
-    def layout(self, cap, x):
-        return TextLayout(center=(x, self.seam_y), max_width=1e9, cap_height=cap, tilt_deg=0.0,
-                          tracking=TEXT_TRACKING, min_squeeze=1.0, outline=TEXT_OUTLINE,
-                          sphere_center=(self.cx, self.cy), sphere_radius=self.r)
-
-    def _place(self, text, cap, x, ss):
-        layout = self.layout(cap, x)
-        fill_m, outer_m, mcx, mcy = render_lettering(text, self.font, layout, ss=ss, outline=True)
-        # Inner shadow: the outside of the letters, nudged down-right and
-        # blurred, as seen through the letters (light comes from top-left).
-        c = cap * ss
-        off = max(1, round(INNER_SHADOW_OFFSET * c))
-        outside = np.pad(1.0 - fill_m, ((off, 0), (off, 0)), constant_values=1.0)[:fill_m.shape[0], :fill_m.shape[1]]
-        shadow_m = fill_m * blur(outside, INNER_SHADOW_SOFTNESS * c)
-        warp = lambda m: place_lettering(m, mcx, mcy, ss, layout, self.shape, style="3d")
-        return warp(fill_m), warp(outer_m), warp(shadow_m)
-
-    def place(self, text, ss=4, shrink=0.94, tolerance=0.002):
-        """(fill, letters+outline, inner shadow) coverage maps."""
-        cap = TEXT_CAP * self.r
-        limit = self.seam_x - self.margin
-        for _ in range(40):
-            x = self.cx - TEXT_MIN_SHIFT * self.r
-            for _ in range(4):           # slide left until clear of the vertical seam
-                fill, outer, shadow = self._place(text, cap, x, ss)
-                cols = np.nonzero(outer.max(0) > 0.05)[0]
-                over = (cols.max() - limit) if len(cols) else 0
-                if over <= 0:
-                    break
-                x -= over + 1
-            total = outer.sum()
-            if total > 0 and (outer * self.forbidden).sum() / total <= tolerance:
-                return fill, outer, shadow
-            cap *= shrink
-        return fill, outer, shadow
+    def render(self, ball_rgb):
+        """The recoloured ball in linear light."""
+        team = srgb_to_linear(np.asarray(ball_rgb, dtype=np.float32) / 255.0)
+        lit = compress_highlights(shoulder(self.maps.shade[..., None] * team) + self.maps.gloss[..., None])
+        p = self.paint[..., None]
+        return p * lit + (1.0 - p) * self.maps.neutral[..., None]
 
 
-def render_ball(maps, alpha, colors, text=None):
-    """colors: (primary, seam, text fill, outline) as sRGB tuples. text:
-    (fill, outer, shadow) coverage maps or None."""
-    lin = lambda rgb: srgb_to_linear(np.asarray(rgb, dtype=np.float32) / 255.0)
-    primary, seam, fill_rgb, outline_rgb = colors
-    albedo = maps.weights @ np.stack([lin(primary), lin(seam)])
-    shade, gloss, paint = maps.shade, maps.gloss, maps.paint
-    if text is not None:
-        fill, outer, shadow = text
-        albedo = albedo + outer[..., None] * (lin(outline_rgb) - albedo)
-        ink = lin(fill_rgb) * (1.0 - INNER_SHADOW * shadow[..., None])
-        albedo = albedo + fill[..., None] * (ink - albedo)
-        # The print lies flat over the seam: under it, take the light of the
-        # smooth ball surface either side instead of the seam's ridges.
-        ball = maps.weights[..., 0] * (alpha > 0.5)
-        sigma = PRINT_SMOOTH * alpha.shape[1]
-        norm = np.maximum(blur(ball, sigma), 1e-6)
-        flat_shade = blur(shade * ball, sigma) / norm
-        flat_gloss = blur(gloss * ball, sigma) / norm
-        shade = shade + outer * (flat_shade - shade)
-        gloss = (gloss + outer * (flat_gloss - gloss)) * (1.0 - TEXT_GLOSS_CUT * outer)
-        paint = np.maximum(paint, outer)
-    lit = compress_highlights(shoulder(shade[..., None] * albedo) + gloss[..., None])
-    out = paint[..., None] * lit + (1.0 - paint[..., None]) * maps.neutral[..., None]
-    rgb8 = np.round(linear_to_srgb(out) * 255).astype(np.uint8)
-    a8 = np.round(np.clip(alpha, 0, 1) * 255).astype(np.uint8)
-    return Image.fromarray(np.dstack([rgb8, a8]), "RGBA")
+def text_masks(text, font_path, cap_flat, width_flat, outline_px, ss):
+    """Flat masks at ss x master scale: (fill, letters+outline, inner shadow,
+    centre column, centre row)."""
+    probe = load_font(font_path, 400)
+    cap_ratio = -probe.getbbox("H", anchor="ls")[1] / 400.0
+    font = load_font(font_path, max(8, round(cap_flat * ss / cap_ratio)))
+    cap = cap_ratio * font.size
+    track = TEXT_TRACKING * cap
+    pad = int(cap * 0.5) + 8
+    advance = [font.getlength(text[:i]) + i * track for i in range(len(text) + 1)]
+    W, H = int(math.ceil(advance[-1])) + 2 * pad, int(math.ceil(cap)) + 2 * pad
+    canvas = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(canvas)
+    baseline = pad + cap
+    for i, ch in enumerate(text):
+        draw.text((pad + advance[i], baseline), ch, font=font, fill=255, anchor="ls")
+    l, t, r, b = canvas.getbbox()
+    # Widen or narrow to the target width; if the text is too wide even at
+    # the narrowest allowed, the whole word shrinks.
+    stretch = width_flat * ss / (r - l)
+    scale_all = 1.0
+    if stretch < STRETCH_LIMITS[0]:
+        scale_all = stretch / STRETCH_LIMITS[0]
+    stretch = min(max(stretch, STRETCH_LIMITS[0]), STRETCH_LIMITS[1])
+    sx, sy = stretch * scale_all, scale_all
+    canvas = canvas.resize((max(1, round(W * sx)), max(1, round(H * sy))), Image.LANCZOS)
+    fill = np.asarray(canvas, dtype=np.float32) / 255.0
+    cx, cy = (l + r) / 2 * sx, (baseline - cap / 2) * sy
+    cap *= sy
+
+    # Outline: grow the letters by the outline width (after the stretch, so
+    # it stays even all round).
+    radius = outline_px * ss
+    margin = int(math.ceil(radius)) + 2
+    fill = np.pad(fill, margin)
+    cx, cy = cx + margin, cy + margin
+    dist = grow_distance(fill > 0.5, np.ones(fill.shape, bool), limit=margin + 2)
+    outer = np.maximum(fill, np.clip(radius + 0.5 - dist, 0.0, 1.0))
+
+    # Inner shadow: the outside of the letters, nudged down and blurred, as
+    # seen through the letters, so the top inner edge is shaded.
+    off = max(1, round(INNER_SHADOW_OFFSET * cap))
+    outside = np.pad(1.0 - fill, ((off, 0), (0, 0)), constant_values=1.0)[:fill.shape[0]]
+    soft = Image.fromarray(np.round(outside * 255).astype(np.uint8)).filter(
+        ImageFilter.GaussianBlur(INNER_SHADOW_SOFTNESS * cap))
+    shadow = fill * (np.asarray(soft, dtype=np.float32) / 255.0)
+    return fill, outer, shadow, cx, cy
 
 
-def add_rim_glow(img, rgb):
-    """Soft glow in the team colour behind the ball's edge."""
-    a = np.asarray(img, dtype=np.float32) / 255.0
-    color, alpha = a[..., :3], a[..., 3]
-    glow = GLOW_STRENGTH * np.clip(blur(alpha, GLOW_SIZE * img.size[0]), 0.0, 1.0)
-    out_a = alpha + glow * (1.0 - alpha)
-    glow_rgb = np.asarray(rgb, dtype=np.float32) / 255.0
-    out_rgb = (color * alpha[..., None] + glow_rgb * (glow * (1.0 - alpha))[..., None]) / np.maximum(out_a, 1e-6)[..., None]
-    return Image.fromarray(np.round(np.dstack([out_rgb, out_a]) * 255).astype(np.uint8), "RGBA")
+def print_text(ball, base_lin, text, ball_rgb, text_rgb, outline_rgb, font_path, outline_px, ss=4):
+    """Composite the printed abbreviation onto the rendered ball (linear)."""
+    rv = BULGE_RADIUS * ball.r
+    # Flat sizes whose projection onto the sphere has the target screen size.
+    cap_flat = 2 * rv * math.asin(min(TEXT_CAP * ball.r / rv, 1.0))
+    width_flat = 2 * rv * math.asin(min(TEXT_WIDTH * ball.r / rv, 1.0))
+    fill_m, outer_m, shadow_m, mcx, mcy = text_masks(text, font_path, cap_flat, width_flat, outline_px, ss)
+    layout = TextLayout(center=(ball.cx, ball.seam_y), max_width=1e9, cap_height=cap_flat, tilt_deg=0.0,
+                        sphere_center=(ball.cx, ball.cy), sphere_radius=rv)
+    warp = lambda m: place_lettering(m, mcx, mcy, ss, layout, base_lin.shape[:2], style="3d")
+    fill, outer, shadow = warp(fill_m), warp(outer_m), warp(shadow_m)
+
+    rows = np.nonzero(outer.max(1) > 0.05)[0]
+    t = np.zeros(outer.shape[0], np.float32)
+    if len(rows):
+        t = np.clip((np.arange(outer.shape[0]) - rows[0]) / max(rows[-1] - rows[0], 1), 0.0, 1.0)
+    grad = (1.0 + FILL_GRADIENT * (1.0 - 2.0 * t))[:, None, None]
+    fill_srgb = np.clip(np.asarray(text_rgb, dtype=np.float32) / 255.0 * grad, 0.0, 1.0)
+    fill_lin = srgb_to_linear(fill_srgb) * (1.0 - INNER_SHADOW * shadow[..., None])
+    outline_lin = srgb_to_linear(np.asarray(outline_rgb, dtype=np.float32) / 255.0)
+    printed = (1.0 - TEXTURE_AMOUNT * (1.0 - ball.texture))[..., None]
+
+    out = base_lin + outer[..., None] * (outline_lin * printed - base_lin)
+    return out + fill[..., None] * (fill_lin * printed - out)
 
 
 def read_balls(path: Path):
@@ -206,26 +233,25 @@ def read_balls(path: Path):
     with open(path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         fields = {f.strip().lower(): f for f in (reader.fieldnames or [])}
-        missing = [c for c in ("city", "abbr", "primary_hex", "secondary_hex") if c not in fields]
+        missing = [c for c in ("abbr", "ball_hex") if c not in fields]
         if missing:
             raise SystemExit(f"{path}: missing column(s): {', '.join(missing)}")
         for line, row in enumerate(reader, start=2):
             get = lambda key: (row.get(fields.get(key, ""), "") or "").strip()
             if not any((v or "").strip() for v in row.values()):
                 continue
-            city = get("city")
-            if not city:
-                raise SystemExit(f"{path}:{line}: empty city")
+            abbr = get("abbr")
+            if not abbr:
+                raise SystemExit(f"{path}:{line}: empty abbr")
             try:
-                primary, secondary = parse_hex(get("primary_hex")), parse_hex(get("secondary_hex"))
-                seam = parse_hex(get("seam_hex")) if get("seam_hex") else darker(primary, SEAM_DARKEN)
-                team = {"city": city, "text": get("abbr"), "primary": primary, "secondary": secondary,
-                        "seam": seam,
-                        "text_color": parse_hex(get("text_hex")) if get("text_hex") else secondary,
-                        "outline": parse_hex(get("outline_hex")) if get("outline_hex") else seam}
+                ball = parse_hex(get("ball_hex"))
+                teams.append({
+                    "abbr": abbr, "team": get("team") or abbr, "ball": ball,
+                    "text": parse_hex(get("text_hex")) if get("text_hex") else TEXT_FILL,
+                    "outline": parse_hex(get("outline_hex")) if get("outline_hex") else darker(ball, OUTLINE_DARKEN),
+                })
             except ValueError as exc:
                 raise SystemExit(f"{path}:{line}: {exc}")
-            teams.append(team)
     if not teams:
         raise SystemExit(f"{path}: no teams found")
     return teams
@@ -236,44 +262,43 @@ def main(argv=None):
     ap.add_argument("--master", type=Path, default=HERE / "master_ball.png")
     ap.add_argument("--teams", type=Path, default=HERE / "balls.csv")
     ap.add_argument("--out", type=Path, default=HERE / "output" / "balls")
-    ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Fredoka-Bold.ttf",
-                    help="TTF/OTF for the abbreviation (default: Fredoka Bold, chunky rounded)")
+    ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Anton-Regular.ttf",
+                    help="TTF/OTF for the abbreviation (default: Anton, bold condensed block)")
     ap.add_argument("--size", type=int, default=1024, help="square canvas size in px (default 1024)")
-    ap.add_argument("--margin", type=float, default=0.07, help="empty border (room for the glow), fraction of the canvas")
+    ap.add_argument("--margin", type=float, default=0.04, help="empty border, fraction of the canvas")
     ap.add_argument("--no-preview", action="store_true", help="skip preview.png")
     args = ap.parse_args(argv)
 
     teams = read_balls(args.teams)
     print(f"analysing {args.master} ...")
-    maps, info = analyse_master(args.master, id_hues=ID_HUES, part_names=PART_NAMES)
-    print("  ID hues (deg): " + ", ".join(f"{p}={h:.0f}" for p, h in zip(PART_NAMES, info["hues"])))
-    alpha = ball_matte(maps)
-    placer = BallText(maps, alpha, args.font)
-    print(f"  ball centre ({placer.cx:.0f}, {placer.cy:.0f}) radius {placer.r:.0f}, "
-          f"horizontal seam y={placer.seam_y:.0f}, vertical seam x={placer.seam_x:.0f}")
+    ball = Ball(args.master)
+    print(f"  ball centre ({ball.cx:.0f}, {ball.cy:.0f}) radius {ball.r:.0f}, middle seam y={ball.seam_y:.0f}")
+    # Outline width is given in output pixels; convert to master pixels.
+    to_canvas = args.size * (1 - 2 * args.margin) / max(ball.crop_size)
+    outline_px = OUTLINE_PX * (args.size / 1024) / to_canvas
 
     args.out.mkdir(parents=True, exist_ok=True)
     entries, seen = [], {}
     for team in teams:
-        slug = slugify(team["city"])
+        slug = slugify(team["abbr"])
         if slug in seen:
-            print(f"  warning: {team['city']!r} overwrites {seen[slug]!r} ({slug}.png)", file=sys.stderr)
-        seen[slug] = team["city"]
-        text = placer.place(team["text"]) if team["text"] else None
-        img = render_ball(maps, alpha, (team["primary"], team["seam"], team["text_color"], team["outline"]), text)
-        img = add_rim_glow(fit_to_canvas(img, args.size, args.margin), team["primary"])
+            print(f"  warning: {team['abbr']!r} overwrites an earlier {slug}.png", file=sys.stderr)
+        seen[slug] = True
+        lin = ball.render(team["ball"])
+        lin = print_text(ball, lin, team["abbr"], team["ball"], team["text"], team["outline"], args.font, outline_px)
+        rgb8 = np.round(linear_to_srgb(lin) * 255).astype(np.uint8)
+        a8 = np.round(ball.alpha * 255).astype(np.uint8)
+        img = fit_to_canvas(Image.fromarray(np.dstack([rgb8, a8]), "RGBA"), args.size, args.margin)
         img.save(args.out / f"{slug}.png")
 
-        swatches = [("ball", team["primary"]), ("seam", team["seam"])]
-        if team["text"]:
-            swatches += [("text", team["text_color"]), ("outline", team["outline"])]
-        entries.append((team["city"], [img], swatches))
-        note = (f", text {team['text']!r} {to_hex(team['text_color'])} outline {to_hex(team['outline'])}"
-                if team["text"] else ", no text")
-        print(f"  {team['city']}: ball {to_hex(team['primary'])}, seam {to_hex(team['seam'])}{note} -> {slug}.png")
+        swatches = [("ball", team["ball"]), ("text", team["text"]), ("outline", team["outline"])]
+        entries.append((team["team"], [img], swatches))
+        print(f"  {team['abbr']}: ball {to_hex(team['ball'])}, text {to_hex(team['text'])}, "
+              f"outline {to_hex(team['outline'])} -> {slug}.png")
 
     if not args.no_preview:
-        contact_sheet(entries, args.out / "preview.png", HERE / "fonts" / "Oswald-Bold.ttf", thumb=380)
+        contact_sheet(entries, args.out / "preview.png", HERE / "fonts" / "Oswald-Bold.ttf", thumb=380,
+                      background=PREVIEW_BG, checker_tiles=False)
         print(f"wrote {args.out / 'preview.png'}")
 
 

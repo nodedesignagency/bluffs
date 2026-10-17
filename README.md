@@ -50,28 +50,25 @@ use `fonts/Oswald-Bold.ttf`. All are SIL Open Font License (`fonts/OFL-*.txt`).
 
 ## Basketballs
 
-`make_balls.py` does the same for `master_ball.png`, a glossy front-facing ball with
-red = ball surface and blue = seams:
+`make_balls.py` recolors `master_ball.png`, a matte pebbled red ball with black seams:
 
 ```
 python make_balls.py
 ```
 
-Outputs go to `output/balls/`: `<City>.png` per team (transparent, same canvas, size and
-position for all) and `preview.png`.
+Outputs go to `output/balls/`: `<ABBR>.png` per team (transparent, same canvas, size and
+position for all) and `preview.png` on the app's dark card color `#1A1A22`.
 
 | column | required | notes |
 |---|---|---|
-| `city` | yes | used for the file name |
-| `abbr` | yes | text on the ball, drawn exactly as written. Leave blank for no text. |
-| `primary_hex` | yes | ball color (glossy highlight and shading are kept) |
-| `secondary_hex` | yes | text fill |
-| `seam_hex` | no | seam color. Default: the primary 35% darker. |
-| `text_hex` | no | overrides the text fill (default: secondary) |
-| `outline_hex` | no | thin outline around the letters. Default: the seam color. |
+| `abbr` | yes | text on the ball and the file name (`BOS` -> `BOS.png`) |
+| `ball_hex` | yes | ball color (shading and pebble texture are kept; black seams stay as they are) |
+| `team` | no | label in the preview |
+| `text_hex` | no | text fill. Default off-white `#F2F2EE`. |
+| `outline_hex` | no | text outline. Default: the ball color 45% darker. |
 
-The abbreviation sits on the horizontal seam, nudged left of center to clear the vertical
-seam, wrapped around the ball in Fredoka Bold with a soft inner shadow so it reads as
-printed. It shrinks automatically if it would touch another seam. The master's soft edge
-glow is trimmed off (alpha eroded 3px and feathered) and replaced by a rim glow in the
-ball color.
+The abbreviation is printed big across the middle seam (cap height 35% of the ball, width
+75%) in Anton, wrapped onto the sphere, with a subtle top-to-bottom gradient, a 3px outline,
+the pebble texture multiplied over it at 20% and a soft inner shadow. The master's faint pink
+edge halo is trimmed off (alpha eroded 2px, feathered 1px). The look is tuned with the
+constants at the top of `make_balls.py`.

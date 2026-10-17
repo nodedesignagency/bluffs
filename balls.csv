@@ -1,1 +1,7 @@
-city,abbr,primary_hex,secondary_hex,seam_hex,text_hex,outline_hex
+team,abbr,ball_hex,text_hex,outline_hex
+Boston,BOS,#007A33,,
+Philadelphia,PHI,#1D428A,,
+Toronto,TOR,#CE1141,,
+Detroit,DET,#1D42BA,,
+Milwaukee,MIL,#00471B,,
+Indiana,IND,#FDBB30,,

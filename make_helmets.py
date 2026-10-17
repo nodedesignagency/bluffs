@@ -485,6 +485,8 @@ def analyse_master(path, pad=6, smooth_shading=True, id_hues=ID_HUES, part_names
     weights = score / np.maximum(score.sum(-1, keepdims=True), 1e-12)
     weights = blur(weights, 0.9 * scale)
     weights /= np.maximum(weights.sum(-1, keepdims=True), 1e-6)
+    if len(id_hues) == 1:
+        weights = np.ones_like(weights)                  # single-colour master: it is all one part
 
     # Team paint vs neutral parts (dark padding, metal screws). Colourful or
     # saturated-and-not-black pixels are paint.
@@ -752,8 +754,9 @@ def slugify(city: str) -> str:
 # Contact sheet
 # --------------------------------------------------------------------------
 
-def contact_sheet(entries, path, font_path, thumb=300):
-    """Grid of (title, [images], [(label, rgb), ...]) entries on a dark sheet."""
+def contact_sheet(entries, path, font_path, thumb=300, background=(24, 27, 34), checker_tiles=True):
+    """Grid of (title, [images], [(label, rgb), ...]) entries on a dark sheet.
+    checker_tiles puts a checkerboard behind each image to show transparency."""
     n = len(entries)
     per_cell = max(len(images) for _, images, _ in entries)
     cols = max(1, math.ceil(math.sqrt(n / per_cell)))
@@ -781,7 +784,7 @@ def contact_sheet(entries, path, font_path, thumb=300):
     cell_h = thumb + label_h
     W = cols * cell_w + (cols + 1) * gap
     H = rows * cell_h + (rows + 1) * gap
-    sheet = Image.new("RGB", (W, H), (24, 27, 34))
+    sheet = Image.new("RGB", (W, H), tuple(background))
     draw = ImageDraw.Draw(sheet)
 
     # Checkerboard behind each image so transparency and fringes show up.
@@ -795,7 +798,8 @@ def contact_sheet(entries, path, font_path, thumb=300):
         cy = gap + (i // cols) * (cell_h + gap)
         for j, img in enumerate(images):
             x = cx + j * (thumb + gap)
-            sheet.paste(checker, (x, cy))
+            if checker_tiles:
+                sheet.paste(checker, (x, cy))
             t = img.convert("RGBa").resize((thumb, thumb), Image.LANCZOS).convert("RGBA")
             sheet.paste(t, (x, cy), t)
         ty = cy + thumb + 6
