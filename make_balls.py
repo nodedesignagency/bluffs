@@ -37,8 +37,7 @@ from make_helmets import (
     place_lettering, shoulder, slugify, smoothstep, srgb_to_linear, to_hex,
 )
 
-EDGE_ERODE = 2                   # px trimmed off the master's edge (removes the pink halo)
-EDGE_FEATHER = 1.0               # px, softness of the new edge
+EDGE_INSET = 4                   # the matte is a clean circle this far (master px) inside the edge
 PEBBLE_SMOOTH = 0.7              # 0 = full pebble texture, 1 = smooth satin
 RIM_LIGHT = 0.45                 # thin light rim around the ball's edge (additive, linear light)
 
@@ -52,9 +51,15 @@ BULGE_RADIUS = 1.0               # sphere the text wraps on, x ball radius (1 = 
 TEXT_FILL = (0xF4, 0xF4, 0xF2)
 OUTLINE = 0.03                   # outline thickness, fraction of cap height
 OUTLINE_DARKEN = 0.45            # default outline = ball colour this much darker
-LETTER_SHADING = 0.85            # how much of the ball's light falls on the letters
-LETTER_GLOSS = 0.5               # how much of the ball's sheen shows on the letters
-LETTER_GRADIENT = 0.22           # letters fade from white at the top to this much darker at the bottom
+LETTER_SHADING = 1.0             # how much of the ball's light falls on the letters
+LETTER_LEVEL = 0.80              # letter brightness in the middle of the text (highlights still reach white)
+LETTER_GRADIENT = 0.15           # letters darker towards the bottom
+EDGE_SHADE = 0.35                # letters darken softly towards their edges (inlaid look)
+EDGE_SHADE_SOFTNESS = 5.0
+BEVEL = 0.6                      # engraved edge: dark along the top inner edge, light along the bottom
+BEVEL_SOFTNESS = 2.5             # bevel width (master px at the 555 px reference radius)
+GROOVE_SHADOW = 0.45             # shadow on the letters beside the middle seam groove
+GROOVE_SOFTNESS = 2.5
 
 PREVIEW_BG = (0x1A, 0x1A, 0x22)
 
@@ -95,38 +100,50 @@ class Ball:
         mx, mn = rgb.max(-1), rgb.min(-1)
         sat = (mx - mn) / np.maximum(mx, 1e-4)
 
-        # Matte: the solid ball with holes filled, eroded and feathered so the
-        # master's pink halo goes.
+        # Matte: a clean circle just inside the ball's edge. The master's edge
+        # has a faint pink halo and the seam ends poke out; the circle drops both.
         solid = fill_holes(self.maps.alpha > 0.5)
-        core = ~dilate(~solid, EDGE_ERODE)
-        self.alpha = np.clip(blur(core.astype(np.float32), EDGE_FEATHER), 0.0, 1.0)
-        self.cx, self.cy, self.r = fit_circle(core)
-        H, W = core.shape
+        self.cx, self.cy, self.r = fit_circle(solid)
+        H, W = solid.shape
         ys, xs = np.mgrid[0:H, 0:W]
-        rho = np.hypot(xs - self.cx, ys - self.cy) / self.r
+        dist = np.hypot(xs - self.cx, ys - self.cy)
+        k = self.r / 555.0
+        edge = self.r - EDGE_INSET * k
+        self.alpha = np.clip(edge - dist + 0.5, 0.0, 1.0).astype(np.float32)
+        rho = dist / edge
 
         # Seams are dark and grey; everything else is ball, including the
-        # washed-out, nearly white top.
-        seam = smoothstep(0.25, 0.12, sat) * smoothstep(0.62, 0.48, mx)
-        self.paint = np.clip(blur(1.0 - seam, 0.7), 0.0, 1.0)
+        # washed-out, nearly white top. Specks are cleaned out so the seam
+        # edges stay smooth.
+        seam = (smoothstep(0.25, 0.12, sat) * smoothstep(0.62, 0.48, mx)) > 0.5
+        rad = max(1, round(2 * k))
+        seam = dilate(~dilate(~seam, rad), rad)          # opening: drop specks
+        seam = ~dilate(~dilate(seam, rad), rad)          # closing: fill pinholes
+        seam_soft = np.clip(blur(seam.astype(np.float32), 0.8 * k), 0.0, 1.0)
+        self.paint = 1.0 - seam_soft
 
         # Satin finish: soften the pebbling, add a light rim.
-        k = self.r / 555.0
         shade, gloss = self.maps.shade, self.maps.gloss
         self.shade = shade + PEBBLE_SMOOTH * (smooth_over(shade, self.paint, 2.5 * k) - shade)
         self.gloss = gloss + PEBBLE_SMOOTH * (smooth_over(gloss, self.paint, 2.5 * k) - gloss)
         self.gloss = self.gloss + RIM_LIGHT * smoothstep(0.935, 1.0, rho) ** 2
 
-        # Broad light across the ball, for lighting the letters.
-        self.light_shade = smooth_over(shade, self.paint, 14 * k)
-        self.light_gloss = smooth_over(self.gloss, self.paint, 6 * k)
+        # How a white surface would be lit at each point, for the letters.
+        self.light = smooth_over(shade, self.paint, 3 * k) + smooth_over(self.gloss, self.paint, 3 * k)
 
-        # Middle seam: the band of seam rows closest to the centre.
+        # Middle seam: the band of seam rows closest to the centre. Where it
+        # crosses the letters it is drawn as a straight band with clean edges.
         cols = slice(int(self.cx - 0.3 * self.r), int(self.cx + 0.3 * self.r))
-        count = (seam[:, cols] > 0.5).sum(1).astype(float)
+        count = seam[:, cols].sum(1).astype(float)
         count[np.abs(np.arange(H) - self.cy) > 0.2 * self.r] = 0
-        band = np.nonzero(count > 0.6 * count.max())[0]
+        band = np.nonzero(count > 0.5 * count.max())[0]
         self.seam_y = float(band.mean())
+        top, bottom = band.min() - 0.5, band.max() + 0.5
+        y = np.arange(H, dtype=np.float32)[:, None]
+        band_cov = np.clip(np.minimum(y - top, bottom - y) + 0.5, 0.0, 1.0) * np.ones((1, W), np.float32)
+        zone = (np.abs(y - self.seam_y) < (bottom - top) / 2 + 6 * k) & (np.abs(xs - self.cx) < 0.9 * self.r)
+        self.text_cut = np.where(zone, band_cov, seam_soft)          # where seams cut through the print
+        self.groove = blur(np.where(zone, band_cov, 0.0), GROOVE_SOFTNESS * k)
 
     def render(self, ball_rgb):
         """The recoloured ball in linear light."""
@@ -190,21 +207,31 @@ def print_text(ball, base_lin, text, text_rgb, outline_rgb, font_path, ss=4):
                         sphere_center=(ball.cx, ball.cy), sphere_radius=rv)
     warp = lambda m: place_lettering(m, mcx, mcy, ss, layout, base_lin.shape[:2], style="3d")
     # The seams run across the print.
-    fill, outer = warp(fill_m) * ball.paint, warp(outer_m) * ball.paint
+    cut = 1.0 - ball.text_cut
+    fill, outer = warp(fill_m) * cut, warp(outer_m) * cut
 
-    # Light the letters like the ball: its broad shading relative to the
-    # middle of the text, plus some of its sheen.
+    # Light the letters like the ball: how a white surface is lit at each
+    # point, relative to the middle of the text.
     inside = fill > 0.5
-    ref = np.median(ball.light_shade[inside]) if inside.any() else 1.0
-    light = np.clip(ball.light_shade / max(ref, 1e-6), 0.4, 1.3) ** LETTER_SHADING
+    ref = np.median(ball.light[inside]) if inside.any() else 1.0
+    light = LETTER_LEVEL * np.clip(ball.light / max(ref, 1e-6), 0.35, 1.4) ** LETTER_SHADING
     rows = np.nonzero(outer.max(1) > 0.05)[0]
     if len(rows):
         t = np.clip((np.arange(outer.shape[0]) - rows[0]) / max(rows[-1] - rows[0], 1), 0.0, 1.0)
         light = light * (1.0 - LETTER_GRADIENT * t)[:, None]
-    sheen = LETTER_GLOSS * ball.light_gloss
+
+    # Engraved edges, light from the top left: the recessed print is shaded
+    # along its top inner edge and catches light along its bottom one.
+    k = ball.r / 555.0
+    soft = BEVEL_SOFTNESS * k
+    gy, gx = np.gradient(blur(outer, soft))
+    bevel = np.clip(-(0.45 * gx + 0.89 * gy) * (soft / 0.4), -1.0, 1.0)
+    edge = blur(1.0 - outer, EDGE_SHADE_SOFTNESS * k)
+    light = light * (1.0 + BEVEL * bevel) * (1.0 - GROOVE_SHADOW * ball.groove) * (1.0 - EDGE_SHADE * edge)
+
     lin = lambda rgb: srgb_to_linear(np.asarray(rgb, dtype=np.float32) / 255.0)
-    fill_lin = compress_highlights(lin(text_rgb) * light[..., None] + sheen[..., None])
-    outline_lin = compress_highlights(lin(outline_rgb) * light[..., None] + sheen[..., None])
+    fill_lin = compress_highlights(lin(text_rgb) * light[..., None])
+    outline_lin = compress_highlights(lin(outline_rgb) * light[..., None])
 
     out = base_lin + outer[..., None] * (outline_lin - base_lin)
     return out + fill[..., None] * (fill_lin - out)

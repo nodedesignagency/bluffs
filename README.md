@@ -69,8 +69,9 @@ position for all) and `preview.png` on the app's dark card color `#1A1A22`.
 
 The ball's pebbling is softened to a satin finish with a thin light rim. The abbreviation is
 printed big across the middle (cap height 45% of the ball, width 72%) in Graduate, a collegiate
-block font, emboldened: white, fading slightly grey towards the bottom, lit like the ball, with a
-thin outline in `outline_hex` (the team accent color), wrapped onto the sphere, and the middle
-seam running across it. The master's faint pink edge halo is trimmed off (alpha eroded 2px,
-feathered 1px). The look is tuned with the
+block font, emboldened: light grey-white lit like the ball, with an engraved edge, soft shading
+towards the letter edges and a shadow beside the seam groove, a thin outline in `outline_hex`
+(the team accent color), wrapped onto the sphere, and the middle seam running across it with
+clean straight edges. The matte is a clean circle just inside the ball's edge, which drops the
+master's faint pink halo and the seam ends that poke out. The look is tuned with the
 constants at the top of `make_balls.py`.
