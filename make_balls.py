@@ -39,7 +39,9 @@ from make_helmets import (
 
 EDGE_INSET = 4                   # the matte is a clean circle this far (master px) inside the edge
 PEBBLE_SMOOTH = 0.7              # 0 = full pebble texture, 1 = smooth satin
-RIM_LIGHT = 0.45                 # thin light rim around the ball's edge (additive, linear light)
+RIM_LIGHT = 0.40                 # thin light rim around the ball's edge (additive, linear light)
+RIM_WIDTH = 12                   # rim light width, master px at the 555 px reference radius
+SPECK_AREA = 60                  # seam specks smaller than this (master px) are cleaned out
 
 TEXT_CAP = 0.45                  # cap height, fraction of the ball's height
 TEXT_WIDTH = 0.72                # text width, fraction of the ball's width
@@ -85,6 +87,16 @@ def fit_circle(mask):
     return float(cx), float(cy), float(math.sqrt(c + cx * cx + cy * cy))
 
 
+def drop_small(mask, min_area):
+    """Remove connected regions of mask smaller than min_area pixels."""
+    rows, starts, ends, labels = components_by_run(mask)
+    if len(rows) == 0:
+        return mask
+    _, comp = np.unique(labels, return_inverse=True)
+    keep = (np.bincount(comp, weights=ends - starts) >= min_area)[comp]
+    return paint_runs(mask.shape, rows[keep], starts[keep], ends[keep])
+
+
 def smooth_over(values, weight, sigma):
     return blur(values * weight, sigma) / np.maximum(blur(weight, sigma), 1e-6)
 
@@ -116,9 +128,10 @@ class Ball:
         # washed-out, nearly white top. Specks are cleaned out so the seam
         # edges stay smooth.
         seam = (smoothstep(0.25, 0.12, sat) * smoothstep(0.62, 0.48, mx)) > 0.5
-        rad = max(1, round(2 * k))
-        seam = dilate(~dilate(~seam, rad), rad)          # opening: drop specks
-        seam = ~dilate(~dilate(seam, rad), rad)          # closing: fill pinholes
+        # Drop specks by size, not thickness: the curved seams get very thin
+        # where they run edge-on along the sides and must survive.
+        seam = drop_small(seam, SPECK_AREA * k * k)
+        seam = ~drop_small(~seam, SPECK_AREA * k * k)    # fill pinholes
         seam_soft = np.clip(blur(seam.astype(np.float32), 0.8 * k), 0.0, 1.0)
         self.paint = 1.0 - seam_soft
 
@@ -126,7 +139,7 @@ class Ball:
         shade, gloss = self.maps.shade, self.maps.gloss
         self.shade = shade + PEBBLE_SMOOTH * (smooth_over(shade, self.paint, 2.5 * k) - shade)
         self.gloss = gloss + PEBBLE_SMOOTH * (smooth_over(gloss, self.paint, 2.5 * k) - gloss)
-        self.gloss = self.gloss + RIM_LIGHT * smoothstep(0.935, 1.0, rho) ** 2
+        self.gloss = self.gloss + RIM_LIGHT * smoothstep(1.0 - RIM_WIDTH * k / self.r, 1.0, rho) ** 2
 
         # How a white surface would be lit at each point, for the letters.
         self.light = smooth_over(shade, self.paint, 3 * k) + smooth_over(self.gloss, self.paint, 3 * k)
