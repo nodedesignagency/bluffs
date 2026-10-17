@@ -270,15 +270,35 @@ def bilinear(img, rows, cols):
 # Master analysis: background matte, part masks, shading
 # --------------------------------------------------------------------------
 
+def border_background(rgb, sigma=4):
+    """Per-pixel background for a soft gradient backdrop, blended in from the
+    four image edges (a Coons patch)."""
+    H, W, _ = rgb.shape
+    strip = lambda a: blur(a[:, None, :], sigma)[:, 0]
+    top, bottom = strip(np.median(rgb[:4], axis=0)), strip(np.median(rgb[-4:], axis=0))
+    left, right = strip(np.median(rgb[:, :4], axis=1)), strip(np.median(rgb[:, -4:], axis=1))
+    u = np.linspace(0.0, 1.0, W, dtype=np.float32)[None, :, None]
+    v = np.linspace(0.0, 1.0, H, dtype=np.float32)[:, None, None]
+    corners = ((1 - u) * (1 - v) * top[0] + u * (1 - v) * top[-1]
+               + (1 - u) * v * bottom[0] + u * v * bottom[-1])
+    bg = ((1 - u) * left[:, None] + u * right[:, None]
+          + (1 - v) * top[None] + v * bottom[None] - corners)
+    return bg.astype(np.float32)
+
+
 def remove_background(rgb, bg_tol=10 / 255, min_hole_area=20, band=2):
-    """Matte the helmet off a plain background.
+    """Matte the subject off a plain or softly graded background.
 
     Returns (alpha, foreground colours with the background unmixed, bg colour).
     """
     H, W, _ = rgb.shape
     edge = np.concatenate([rgb[:4].reshape(-1, 3), rgb[-4:].reshape(-1, 3),
                            rgb[:, :4].reshape(-1, 3), rgb[:, -4:].reshape(-1, 3)])
-    bg_color = np.median(edge, axis=0).astype(np.float32)
+    lo, hi = np.percentile(edge, [1, 99], axis=0)
+    if (hi - lo).max() > bg_tol:
+        bg_color = border_background(rgb)      # gradient backdrop
+    else:
+        bg_color = np.median(edge, axis=0).astype(np.float32)
     dist = np.abs(rgb - bg_color).max(-1)
 
     # Background-coloured regions count as background if they touch the image
@@ -434,7 +454,7 @@ class HelmetMaps:
         return self.alpha.shape[1], self.alpha.shape[0]
 
 
-def analyse_master(path, pad=6):
+def analyse_master(path, pad=6, smooth_shading=True):
     img = Image.open(path)
     if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
         # Already cut out: composite on white so the same matting path applies.
@@ -499,9 +519,11 @@ def analyse_master(path, pad=6):
     # The render's surface grain (and any compression noise) lives in the
     # shading. Smooth it lightly, never across a part boundary, so light
     # team colours don't come out blotchy.
-    support = alpha * paint
-    shade = smooth_within_parts(shade, weights, support, 1.0 * scale)
-    gloss = smooth_within_parts(gloss, weights, support, 0.5 * scale)
+    # Turn this off for surfaces whose texture should survive (pebbled balls).
+    if smooth_shading:
+        support = alpha * paint
+        shade = smooth_within_parts(shade, weights, support, 1.0 * scale)
+        gloss = smooth_within_parts(gloss, weights, support, 0.5 * scale)
 
     neutral = lin @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
     stripe_near, stripe_far = stripe_distances(alpha, weights, scale)
@@ -727,49 +749,59 @@ def slugify(city: str) -> str:
 # --------------------------------------------------------------------------
 
 def contact_sheet(entries, path, font_path, thumb=300):
+    """Grid of (title, [images], [(label, rgb), ...]) entries on a dark sheet."""
     n = len(entries)
-    cols = max(1, math.ceil(math.sqrt(n / 2)))
+    per_cell = max(len(images) for _, images, _ in entries)
+    cols = max(1, math.ceil(math.sqrt(n / per_cell)))
     rows = math.ceil(n / cols)
-    gap, label_h = 16, 104
-    cell_w, cell_h = 2 * thumb + gap, thumb + label_h
+    gap = 16
+    cell_w = per_cell * thumb + (per_cell - 1) * gap
+    title_font = load_font(font_path, 26)
+    small_font = load_font(font_path, 15)
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+    def swatch_layout(swatches):
+        """(x offset, row) for each swatch, wrapping at the cell width."""
+        out, sx, row = [], 0, 0
+        for label, _ in swatches:
+            need = 25 + int(measure.textlength(f"{label} #000000", font=small_font)) + 10
+            if sx > 0 and sx + need > cell_w:
+                sx, row = 0, row + 1
+            out.append((sx, row))
+            hx = sx + 25 + int(measure.textlength(label, font=small_font)) + 6
+            sx = hx + int(measure.textlength("#000000", font=small_font)) + 22
+        return out
+
+    swatch_rows = max((swatch_layout(sw)[-1][1] + 1 if sw else 0) for _, _, sw in entries)
+    label_h = 42 + 26 * max(swatch_rows, 2) + 10
+    cell_h = thumb + label_h
     W = cols * cell_w + (cols + 1) * gap
     H = rows * cell_h + (rows + 1) * gap
     sheet = Image.new("RGB", (W, H), (24, 27, 34))
     draw = ImageDraw.Draw(sheet)
-    title_font = load_font(font_path, 26)
-    small_font = load_font(font_path, 15)
 
-    # Checkerboard behind each helmet so transparency and fringes show up.
+    # Checkerboard behind each image so transparency and fringes show up.
     tile = 12
     yy, xx = np.mgrid[0:thumb, 0:thumb]
     check = np.where(((yy // tile + xx // tile) % 2)[..., None] == 0, (58, 62, 72), (72, 77, 89)).astype(np.uint8)
     checker = Image.fromarray(check, "RGB")
 
-    for i, (team, right, left) in enumerate(entries):
+    for i, (title, images, swatches) in enumerate(entries):
         cx = gap + (i % cols) * (cell_w + gap)
         cy = gap + (i // cols) * (cell_h + gap)
-        for j, img in enumerate((right, left)):
+        for j, img in enumerate(images):
             x = cx + j * (thumb + gap)
             sheet.paste(checker, (x, cy))
             t = img.convert("RGBa").resize((thumb, thumb), Image.LANCZOS).convert("RGBA")
             sheet.paste(t, (x, cy), t)
         ty = cy + thumb + 6
-        draw.text((cx, ty), team["city"], font=title_font, fill=(240, 240, 240))
-        sx, sy = cx, ty + 42
-        swatches = [("shell", team["shell"]), ("stripe", team["stripe"]), ("mask", team["facemask"])]
-        if team["text"]:
-            swatches.append(("text", team["text_color"]))
-        if team["outline"]:
-            swatches.append(("outline", team["outline"]))
-        for label, rgb in swatches:
-            need = 25 + int(draw.textlength(f"{label} #000000", font=small_font)) + 10
-            if sx > cx and sx + need > cx + cell_w:
-                sx, sy = cx, sy + 26
+        draw.text((cx, ty), title, font=title_font, fill=(240, 240, 240))
+        for (label, rgb), (dx, row) in zip(swatches, swatch_layout(swatches)):
+            sx, sy = cx + dx, ty + 42 + 26 * row
             draw.rectangle((sx, sy, sx + 18, sy + 18), fill=tuple(rgb), outline=(140, 140, 150))
             draw.text((sx + 25, sy + 9), label, font=small_font, fill=(150, 155, 165), anchor="lm")
             hx = sx + 25 + int(draw.textlength(label, font=small_font)) + 6
             draw.text((hx, sy + 9), to_hex(rgb), font=small_font, fill=(225, 227, 232), anchor="lm")
-            sx = hx + int(draw.textlength("#000000", font=small_font)) + 22
     sheet.save(path)
 
 
@@ -888,7 +920,12 @@ def main(argv=None):
             img = fit_to_canvas(img, args.size, args.margin)
             img.save(args.out / f"{slug}_{side}.png")
             outputs[side] = img
-        entries.append((team, outputs["right"], outputs["left"]))
+        swatches = [("shell", team["shell"]), ("stripe", team["stripe"]), ("mask", team["facemask"])]
+        if team["text"]:
+            swatches.append(("text", team["text_color"]))
+        if team["outline"]:
+            swatches.append(("outline", team["outline"]))
+        entries.append((team["city"], [outputs["right"], outputs["left"]], swatches))
         text_note = f", text {team['text']!r} {to_hex(team['text_color'])}" if team["text"] else ", no text"
         if team["outline"]:
             text_note += f" outline {to_hex(team['outline'])}"

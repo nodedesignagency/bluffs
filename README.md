@@ -47,3 +47,27 @@ position, and the text is drawn after the flip, so it never reads backwards.
 Helmet text uses `fonts/Anton-Regular.ttf` (heavy condensed, Impact-style). Use `--font` for another
 TTF/OTF. The preview labels use `fonts/Oswald-Bold.ttf`. Both are SIL Open Font License
 (`fonts/OFL-Anton.txt`, `fonts/OFL-Oswald.txt`).
+
+## Basketballs
+
+`make_balls.py` does the same for `master_ball.png` (red panels, green panels, blue seams):
+
+```
+python make_balls.py
+```
+
+Outputs go to `output/balls/`: `<City>.png` per team (transparent, same canvas, size and
+position for all) and `preview.png`. The pebbled texture and shading of the master are kept.
+
+| column | required | notes |
+|---|---|---|
+| `city` | yes | used for the file name |
+| `abbr` | yes | text on the front panel, drawn exactly as written. Leave blank for no text. |
+| `primary_hex` | yes | red ID panels |
+| `secondary_hex` | yes | green ID panels |
+| `seam_hex` | no | blue ID seams. Default near-black `#1A1A1A`. |
+| `text_hex` | no | text color. If blank, the most contrasting of secondary/seam is used, or white/black. |
+| `outline_hex` | no | outline around the letters. Leave blank for no outline. |
+
+The text goes on the largest primary panel facing the camera, wrapped around the ball, and
+shrinks automatically so it never crosses a seam.
