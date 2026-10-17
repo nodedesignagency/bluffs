@@ -10,9 +10,8 @@ optional team, text_hex and outline_hex) this writes
 
 The red takes the team colour with the master's shading and pebble texture
 kept; the black seams are left as they are. The abbreviation is printed big
-across the middle seam: a bold condensed block font in off-white with a
-subtle top-to-bottom gradient, a thin outline in a darker shade of the ball
-colour, wrapped onto the sphere, with the pebble texture multiplied over it
+across the middle seam in the NFL helmet lettering (Anton, white, outlined in
+a darker shade of the ball colour), wrapped onto the sphere, with the pebble texture multiplied over it
 and a soft inner shadow so it reads as printed on the rubber. The master's
 faint pink edge halo is trimmed off.
 
@@ -40,15 +39,16 @@ from make_helmets import (
 EDGE_ERODE = 2                   # px trimmed off the master's edge (removes the pink halo)
 EDGE_FEATHER = 1.0               # px, softness of the new edge
 
-TEXT_CAP = 0.35                  # cap height, fraction of the ball's height
-TEXT_WIDTH = 0.75                # text width, fraction of the ball's width
-STRETCH_LIMITS = (0.7, 1.7)      # how far the font may be widened or narrowed to hit TEXT_WIDTH
-TEXT_TRACKING = 0.05             # letter spacing, fraction of cap height
-BULGE_RADIUS = 1.25              # sphere the text wraps on, x ball radius (1 = full curve, larger = flatter)
+# Lettering matches the NFL helmets: Anton at its natural width, white, with
+# the same letter spacing and outline weight.
+TEXT_CAP = 0.40                  # cap height, fraction of the ball's height
+TEXT_MAX_WIDTH = 0.78            # wider words shrink to this, fraction of the ball's width
+TEXT_TRACKING = 0.04             # letter spacing, fraction of cap height (as on the helmets)
+BULGE_RADIUS = 1.0               # sphere the text wraps on, x ball radius (1 = full curve, larger = flatter)
 
-TEXT_FILL = (0xF2, 0xF2, 0xEE)
-FILL_GRADIENT = 0.05             # top this much lighter, bottom this much darker
-OUTLINE_PX = 3.0                 # outline width in output pixels at the default 1024 canvas
+TEXT_FILL = (0xFF, 0xFF, 0xFF)
+FILL_GRADIENT = 0.06             # bottom of the letters this much darker
+OUTLINE = 0.05                   # outline thickness, fraction of cap height (as on the helmets)
 OUTLINE_DARKEN = 0.45            # outline = ball colour this much darker
 TEXTURE_AMOUNT = 0.20            # pebble texture multiplied over the print
 INNER_SHADOW = 0.35              # darkening along the top inner edge (pressed in, light from above)
@@ -153,7 +153,7 @@ class Ball:
         return p * lit + (1.0 - p) * self.maps.neutral[..., None]
 
 
-def text_masks(text, font_path, cap_flat, width_flat, outline_px, ss):
+def text_masks(text, font_path, cap_flat, max_width_flat, ss):
     """Flat masks at ss x master scale: (fill, letters+outline, inner shadow,
     centre column, centre row)."""
     probe = load_font(font_path, 400)
@@ -170,22 +170,16 @@ def text_masks(text, font_path, cap_flat, width_flat, outline_px, ss):
     for i, ch in enumerate(text):
         draw.text((pad + advance[i], baseline), ch, font=font, fill=255, anchor="ls")
     l, t, r, b = canvas.getbbox()
-    # Widen or narrow to the target width; if the text is too wide even at
-    # the narrowest allowed, the whole word shrinks.
-    stretch = width_flat * ss / (r - l)
-    scale_all = 1.0
-    if stretch < STRETCH_LIMITS[0]:
-        scale_all = stretch / STRETCH_LIMITS[0]
-    stretch = min(max(stretch, STRETCH_LIMITS[0]), STRETCH_LIMITS[1])
-    sx, sy = stretch * scale_all, scale_all
-    canvas = canvas.resize((max(1, round(W * sx)), max(1, round(H * sy))), Image.LANCZOS)
+    # Natural proportions; a word too wide for the ball shrinks as a whole.
+    k = min(1.0, max_width_flat * ss / (r - l))
+    if k < 1.0:
+        canvas = canvas.resize((max(1, round(W * k)), max(1, round(H * k))), Image.LANCZOS)
     fill = np.asarray(canvas, dtype=np.float32) / 255.0
-    cx, cy = (l + r) / 2 * sx, (baseline - cap / 2) * sy
-    cap *= sy
+    cx, cy = (l + r) / 2 * k, (baseline - cap / 2) * k
+    cap *= k
 
-    # Outline: grow the letters by the outline width (after the stretch, so
-    # it stays even all round).
-    radius = outline_px * ss
+    # Outline: grow the letters by the outline width.
+    radius = OUTLINE * cap
     margin = int(math.ceil(radius)) + 2
     fill = np.pad(fill, margin)
     cx, cy = cx + margin, cy + margin
@@ -202,13 +196,13 @@ def text_masks(text, font_path, cap_flat, width_flat, outline_px, ss):
     return fill, outer, shadow, cx, cy
 
 
-def print_text(ball, base_lin, text, ball_rgb, text_rgb, outline_rgb, font_path, outline_px, ss=4):
+def print_text(ball, base_lin, text, text_rgb, outline_rgb, font_path, ss=4):
     """Composite the printed abbreviation onto the rendered ball (linear)."""
     rv = BULGE_RADIUS * ball.r
     # Flat sizes whose projection onto the sphere has the target screen size.
     cap_flat = 2 * rv * math.asin(min(TEXT_CAP * ball.r / rv, 1.0))
-    width_flat = 2 * rv * math.asin(min(TEXT_WIDTH * ball.r / rv, 1.0))
-    fill_m, outer_m, shadow_m, mcx, mcy = text_masks(text, font_path, cap_flat, width_flat, outline_px, ss)
+    width_flat = 2 * rv * math.asin(min(TEXT_MAX_WIDTH * ball.r / rv, 1.0))
+    fill_m, outer_m, shadow_m, mcx, mcy = text_masks(text, font_path, cap_flat, width_flat, ss)
     layout = TextLayout(center=(ball.cx, ball.seam_y), max_width=1e9, cap_height=cap_flat, tilt_deg=0.0,
                         sphere_center=(ball.cx, ball.cy), sphere_radius=rv)
     warp = lambda m: place_lettering(m, mcx, mcy, ss, layout, base_lin.shape[:2], style="3d")
@@ -218,7 +212,7 @@ def print_text(ball, base_lin, text, ball_rgb, text_rgb, outline_rgb, font_path,
     t = np.zeros(outer.shape[0], np.float32)
     if len(rows):
         t = np.clip((np.arange(outer.shape[0]) - rows[0]) / max(rows[-1] - rows[0], 1), 0.0, 1.0)
-    grad = (1.0 + FILL_GRADIENT * (1.0 - 2.0 * t))[:, None, None]
+    grad = (1.0 - FILL_GRADIENT * t)[:, None, None]
     fill_srgb = np.clip(np.asarray(text_rgb, dtype=np.float32) / 255.0 * grad, 0.0, 1.0)
     fill_lin = srgb_to_linear(fill_srgb) * (1.0 - INNER_SHADOW * shadow[..., None])
     outline_lin = srgb_to_linear(np.asarray(outline_rgb, dtype=np.float32) / 255.0)
@@ -263,7 +257,7 @@ def main(argv=None):
     ap.add_argument("--teams", type=Path, default=HERE / "balls.csv")
     ap.add_argument("--out", type=Path, default=HERE / "output" / "balls")
     ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Anton-Regular.ttf",
-                    help="TTF/OTF for the abbreviation (default: Anton, bold condensed block)")
+                    help="TTF/OTF for the abbreviation (default: Anton, as on the helmets)")
     ap.add_argument("--size", type=int, default=1024, help="square canvas size in px (default 1024)")
     ap.add_argument("--margin", type=float, default=0.04, help="empty border, fraction of the canvas")
     ap.add_argument("--no-preview", action="store_true", help="skip preview.png")
@@ -273,9 +267,6 @@ def main(argv=None):
     print(f"analysing {args.master} ...")
     ball = Ball(args.master)
     print(f"  ball centre ({ball.cx:.0f}, {ball.cy:.0f}) radius {ball.r:.0f}, middle seam y={ball.seam_y:.0f}")
-    # Outline width is given in output pixels; convert to master pixels.
-    to_canvas = args.size * (1 - 2 * args.margin) / max(ball.crop_size)
-    outline_px = OUTLINE_PX * (args.size / 1024) / to_canvas
 
     args.out.mkdir(parents=True, exist_ok=True)
     entries, seen = [], {}
@@ -285,7 +276,7 @@ def main(argv=None):
             print(f"  warning: {team['abbr']!r} overwrites an earlier {slug}.png", file=sys.stderr)
         seen[slug] = True
         lin = ball.render(team["ball"])
-        lin = print_text(ball, lin, team["abbr"], team["ball"], team["text"], team["outline"], args.font, outline_px)
+        lin = print_text(ball, lin, team["abbr"], team["text"], team["outline"], args.font)
         rgb8 = np.round(linear_to_srgb(lin) * 255).astype(np.uint8)
         a8 = np.round(ball.alpha * 255).astype(np.uint8)
         img = fit_to_canvas(Image.fromarray(np.dstack([rgb8, a8]), "RGBA"), args.size, args.margin)

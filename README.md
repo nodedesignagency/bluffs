@@ -64,11 +64,12 @@ position for all) and `preview.png` on the app's dark card color `#1A1A22`.
 | `abbr` | yes | text on the ball and the file name (`BOS` -> `BOS.png`) |
 | `ball_hex` | yes | ball color (shading and pebble texture are kept; black seams stay as they are) |
 | `team` | no | label in the preview |
-| `text_hex` | no | text fill. Default off-white `#F2F2EE`. |
+| `text_hex` | no | text fill. Default white. |
 | `outline_hex` | no | text outline. Default: the ball color 45% darker. |
 
-The abbreviation is printed big across the middle seam (cap height 35% of the ball, width
-75%) in Anton, wrapped onto the sphere, with a subtle top-to-bottom gradient, a 3px outline,
-the pebble texture multiplied over it at 20% and a soft inner shadow. The master's faint pink
+The abbreviation is printed big across the middle seam (cap height 40% of the ball) in the
+same lettering as the helmets: Anton at its natural width, white, outline 5% of the letter
+height. It is wrapped onto the sphere, with a subtle top-to-bottom gradient, the pebble
+texture multiplied over it at 20% and a soft inner shadow. The master's faint pink
 edge halo is trimmed off (alpha eroded 2px, feathered 1px). The look is tuned with the
 constants at the top of `make_balls.py`.
