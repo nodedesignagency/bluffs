@@ -355,13 +355,13 @@ def smooth_within_parts(values, weights, support, sigma):
     return trust * out + (1 - trust) * values
 
 
-def calibrate_hues(hue, chroma, alpha):
+def calibrate_hues(hue, chroma, alpha, id_hues=ID_HUES):
     """Find the actual ID hues in the master (renders drift off pure RGB)."""
     sel = (chroma > 0.25) & (alpha > 0.5)
     hist = np.bincount(np.round(hue[sel]).astype(int) % 360, minlength=360).astype(np.float32)
     hist = np.convolve(np.concatenate([hist[-5:], hist, hist[:5]]), np.ones(11) / 11, "valid")
     centers = []
-    for nominal in ID_HUES:
+    for nominal in id_hues:
         window = (np.arange(360) - nominal + 180) % 360 - 180
         cand = np.where(np.abs(window) <= 60, hist, -1)
         peak = int(np.argmax(cand))
@@ -425,11 +425,11 @@ class HelmetMaps:
     shade: np.ndarray     # (H, W) diffuse light relative to each part's base tone
     gloss: np.ndarray     # (H, W) additive white from glossy highlights (linear)
     neutral: np.ndarray   # (H, W) grey level for neutral pixels (linear)
-    stripe_near: np.ndarray  # (H, W) px from the stripe's shell-side edge (inf off the stripe)
-    stripe_far: np.ndarray   # (H, W) px from the stripe's outer edge (inf off the stripe)
+    stripe_near: np.ndarray | None  # (H, W) px from the stripe's shell-side edge (helmets only)
+    stripe_far: np.ndarray | None   # (H, W) px from the stripe's outer edge (helmets only)
 
     def flipped(self) -> HelmetMaps:
-        return HelmetMaps(*(np.ascontiguousarray(a[:, ::-1]) for a in
+        return HelmetMaps(*(None if a is None else np.ascontiguousarray(a[:, ::-1]) for a in
                             (self.alpha, self.weights, self.paint, self.shade, self.gloss, self.neutral,
                              self.stripe_near, self.stripe_far)))
 
@@ -454,7 +454,9 @@ class HelmetMaps:
         return self.alpha.shape[1], self.alpha.shape[0]
 
 
-def analyse_master(path, pad=6, smooth_shading=True):
+def analyse_master(path, pad=6, smooth_shading=True, id_hues=ID_HUES, part_names=PARTS):
+    """Matte the master and split it into parts by ID hue (one per entry of
+    id_hues), with shading and gloss per pixel."""
     img = Image.open(path)
     if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
         # Already cut out: composite on white so the same matting path applies.
@@ -478,7 +480,7 @@ def analyse_master(path, pad=6, smooth_shading=True):
     mx, mn = fg.max(-1), fg.min(-1)
     chroma = mx - mn
     sat = chroma / np.maximum(mx, 1e-4)
-    centers = calibrate_hues(hue, chroma, alpha)
+    centers = calibrate_hues(hue, chroma, alpha, id_hues)
     score = np.stack([np.exp(-(hue_distance(hue, c) / 20.0) ** 2) for c in centers], -1)
     weights = score / np.maximum(score.sum(-1, keepdims=True), 1e-12)
     weights = blur(weights, 0.9 * scale)
@@ -494,12 +496,12 @@ def analyse_master(path, pad=6, smooth_shading=True):
     lin = srgb_to_linear(fg)
     core = alpha > 0.99
     base = []
-    for k in range(3):
+    for k in range(len(id_hues)):
         sel = core & (weights[..., k] > 0.95) & (paint > 0.95)
         if sel.sum() < 50:
-            raise SystemExit(f"{path}: no {PARTS[k]} pixels found (expected hue near {ID_HUES[k]:.0f} deg)")
+            raise SystemExit(f"{path}: no {part_names[k]} pixels found (expected hue near {id_hues[k]:.0f} deg)")
         base.append(np.median(lin[sel], axis=0))
-    base = np.array(base, dtype=np.float32)              # (3 parts, rgb)
+    base = np.array(base, dtype=np.float32)              # (parts, rgb)
 
     albedo = weights @ base                              # expected ID colour per pixel
     aa = (albedo * albedo).sum(-1)
@@ -526,7 +528,9 @@ def analyse_master(path, pad=6, smooth_shading=True):
         gloss = smooth_within_parts(gloss, weights, support, 0.5 * scale)
 
     neutral = lin @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-    stripe_near, stripe_far = stripe_distances(alpha, weights, scale)
+    stripe_near = stripe_far = None                      # only helmets have a stripe to narrow
+    if tuple(part_names) == PARTS:
+        stripe_near, stripe_far = stripe_distances(alpha, weights, scale)
 
     maps = HelmetMaps(alpha, weights.astype(np.float32), paint.astype(np.float32),
                       shade.astype(np.float32), gloss.astype(np.float32), neutral.astype(np.float32),

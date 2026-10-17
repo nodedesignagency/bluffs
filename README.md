@@ -44,30 +44,34 @@ position, and the text is drawn after the flip, so it never reads backwards.
 
 ## Fonts
 
-Helmet text uses `fonts/Anton-Regular.ttf` (heavy condensed, Impact-style). Use `--font` for another
-TTF/OTF. The preview labels use `fonts/Oswald-Bold.ttf`. Both are SIL Open Font License
-(`fonts/OFL-Anton.txt`, `fonts/OFL-Oswald.txt`).
+Helmet text uses `fonts/Anton-Regular.ttf` (heavy condensed, Impact-style) and ball text uses
+`fonts/Fredoka-Bold.ttf` (chunky rounded). Use `--font` for another TTF/OTF. The preview labels
+use `fonts/Oswald-Bold.ttf`. All are SIL Open Font License (`fonts/OFL-*.txt`).
 
 ## Basketballs
 
-`make_balls.py` does the same for `master_ball.png` (red panels, green panels, blue seams):
+`make_balls.py` does the same for `master_ball.png`, a glossy front-facing ball with
+red = ball surface and blue = seams:
 
 ```
 python make_balls.py
 ```
 
 Outputs go to `output/balls/`: `<City>.png` per team (transparent, same canvas, size and
-position for all) and `preview.png`. The pebbled texture and shading of the master are kept.
+position for all) and `preview.png`.
 
 | column | required | notes |
 |---|---|---|
 | `city` | yes | used for the file name |
-| `abbr` | yes | text on the front panel, drawn exactly as written. Leave blank for no text. |
-| `primary_hex` | yes | red ID panels |
-| `secondary_hex` | yes | green ID panels |
-| `seam_hex` | no | blue ID seams. Default near-black `#1A1A1A`. |
-| `text_hex` | no | text color. If blank, the most contrasting of secondary/seam is used, or white/black. |
-| `outline_hex` | no | outline around the letters. Leave blank for no outline. |
+| `abbr` | yes | text on the ball, drawn exactly as written. Leave blank for no text. |
+| `primary_hex` | yes | ball color (glossy highlight and shading are kept) |
+| `secondary_hex` | yes | text fill |
+| `seam_hex` | no | seam color. Default: the primary 35% darker. |
+| `text_hex` | no | overrides the text fill (default: secondary) |
+| `outline_hex` | no | thin outline around the letters. Default: the seam color. |
 
-The text goes on the largest primary panel facing the camera, wrapped around the ball, and
-shrinks automatically so it never crosses a seam.
+The abbreviation sits on the horizontal seam, nudged left of center to clear the vertical
+seam, wrapped around the ball in Fredoka Bold with a soft inner shadow so it reads as
+printed. It shrinks automatically if it would touch another seam. The master's soft edge
+glow is trimmed off (alpha eroded 3px and feathered) and replaced by a rim glow in the
+ball color.
