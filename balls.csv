@@ -1,7 +1,7 @@
 team,abbr,ball_hex,text_hex,outline_hex
-Boston,BOS,#007A33,,
-Philadelphia,PHI,#1D428A,,
-Toronto,TOR,#CE1141,,
-Detroit,DET,#1D42BA,,
-Milwaukee,MIL,#00471B,,
-Indiana,IND,#FDBB30,,
+Boston,BOS,#007A33,,#BA9653
+Philadelphia,PHI,#1D428A,,#ED174C
+Toronto,TOR,#CE1141,,#1A1A1A
+Detroit,DET,#1D42BA,,#C8102E
+Milwaukee,MIL,#00471B,,#EEE1C6
+Indiana,IND,#FDBB30,,#002D62

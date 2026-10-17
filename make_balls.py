@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Generate team-coloured basketballs from one master render.
 
-The master image is a matte, pebbled, solid red basketball with black seams on
-a white background. For every row of the balls CSV (abbr, ball_hex, plus
+The master image is a pebbled, solid red basketball with black seams on a
+white background. For every row of the balls CSV (abbr, ball_hex, plus
 optional team, text_hex and outline_hex) this writes
 
     <out>/<ABBR>.png      transparent PNG, same canvas, size and position for all
     <out>/preview.png     grid of every ball on the app's dark card colour
 
-The red takes the team colour with the master's shading and pebble texture
-kept; the black seams are left as they are. The abbreviation is printed big
-across the middle seam in the NFL helmet lettering (Anton, white, outlined in
-a darker shade of the ball colour), wrapped onto the sphere, with the pebble texture multiplied over it
-and a soft inner shadow so it reads as printed on the rubber. The master's
-faint pink edge halo is trimmed off.
+The red takes the team colour with the master's shading kept (the pebbling
+softened to a satin finish, with a light rim around the edge); the black
+seams are left as they are. The abbreviation is printed big across the
+middle in a heavy collegiate block letter: white, a thin outline in the
+team's accent colour, wrapped onto the sphere and lit like the ball, with
+the middle seam running across it. The master's faint pink edge halo is
+trimmed off.
 
     python make_balls.py
     python make_balls.py --teams balls.csv --out output/balls --size 1024
@@ -28,7 +29,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 from make_helmets import (
     HERE, TextLayout, analyse_master, blur, components_by_run, compress_highlights, contact_sheet,
@@ -38,22 +39,22 @@ from make_helmets import (
 
 EDGE_ERODE = 2                   # px trimmed off the master's edge (removes the pink halo)
 EDGE_FEATHER = 1.0               # px, softness of the new edge
+PEBBLE_SMOOTH = 0.7              # 0 = full pebble texture, 1 = smooth satin
+RIM_LIGHT = 0.45                 # thin light rim around the ball's edge (additive, linear light)
 
-# Lettering matches the NFL helmets: Anton at its natural width, white, with
-# the same letter spacing and outline weight.
-TEXT_CAP = 0.40                  # cap height, fraction of the ball's height
-TEXT_MAX_WIDTH = 0.78            # wider words shrink to this, fraction of the ball's width
-TEXT_TRACKING = 0.04             # letter spacing, fraction of cap height (as on the helmets)
-BULGE_RADIUS = 1.0               # sphere the text wraps on, x ball radius (1 = full curve, larger = flatter)
+TEXT_CAP = 0.45                  # cap height, fraction of the ball's height
+TEXT_WIDTH = 0.72                # text width, fraction of the ball's width
+STRETCH_LIMITS = (0.80, 1.25)    # how far the letters may be narrowed / widened to hit TEXT_WIDTH
+TEXT_TRACKING = 0.03             # letter spacing, fraction of cap height
+EMBOLDEN = 0.04                  # extra stroke weight, fraction of cap height (Graduate is light)
+BULGE_RADIUS = 1.0               # sphere the text wraps on, x ball radius (1 = full curve)
 
-TEXT_FILL = (0xFF, 0xFF, 0xFF)
-FILL_GRADIENT = 0.06             # bottom of the letters this much darker
-OUTLINE = 0.05                   # outline thickness, fraction of cap height (as on the helmets)
-OUTLINE_DARKEN = 0.45            # outline = ball colour this much darker
-TEXTURE_AMOUNT = 0.20            # pebble texture multiplied over the print
-INNER_SHADOW = 0.35              # darkening along the top inner edge (pressed in, light from above)
-INNER_SHADOW_OFFSET = 0.035      # fraction of cap height
-INNER_SHADOW_SOFTNESS = 0.05     # fraction of cap height
+TEXT_FILL = (0xF4, 0xF4, 0xF2)
+OUTLINE = 0.03                   # outline thickness, fraction of cap height
+OUTLINE_DARKEN = 0.45            # default outline = ball colour this much darker
+LETTER_SHADING = 0.85            # how much of the ball's light falls on the letters
+LETTER_GLOSS = 0.5               # how much of the ball's sheen shows on the letters
+LETTER_GRADIENT = 0.22           # letters fade from white at the top to this much darker at the bottom
 
 PREVIEW_BG = (0x1A, 0x1A, 0x22)
 
@@ -79,14 +80,17 @@ def fit_circle(mask):
     return float(cx), float(cy), float(math.sqrt(c + cx * cx + cy * cy))
 
 
+def smooth_over(values, weight, sigma):
+    return blur(values * weight, sigma) / np.maximum(blur(weight, sigma), 1e-6)
+
+
 class Ball:
     """Everything derived from the master once: matte, paint/seam split,
-    shading, pebble texture and the ball's geometry."""
+    shading and the ball's geometry."""
 
     def __init__(self, path):
         self.maps, info = analyse_master(path, smooth_shading=False, id_hues=(0.0,), part_names=("ball",))
         x0, y0, x1, y1 = info["crop"]
-        self.crop_size = (x1 - x0, y1 - y0)
         rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)[y0:y1, x0:x1] / 255.0
         mx, mn = rgb.max(-1), rgb.min(-1)
         sat = (mx - mn) / np.maximum(mx, 1e-4)
@@ -96,104 +100,83 @@ class Ball:
         solid = fill_holes(self.maps.alpha > 0.5)
         core = ~dilate(~solid, EDGE_ERODE)
         self.alpha = np.clip(blur(core.astype(np.float32), EDGE_FEATHER), 0.0, 1.0)
+        self.cx, self.cy, self.r = fit_circle(core)
+        H, W = core.shape
+        ys, xs = np.mgrid[0:H, 0:W]
+        rho = np.hypot(xs - self.cx, ys - self.cy) / self.r
 
         # Seams are dark and grey; everything else is ball, including the
         # washed-out, nearly white top.
         seam = smoothstep(0.25, 0.12, sat) * smoothstep(0.62, 0.48, mx)
         self.paint = np.clip(blur(1.0 - seam, 0.7), 0.0, 1.0)
-        self.seam = (seam > 0.5) & solid
 
-        self.cx, self.cy, self.r = fit_circle(core)
+        # Satin finish: soften the pebbling, add a light rim.
+        k = self.r / 555.0
+        shade, gloss = self.maps.shade, self.maps.gloss
+        self.shade = shade + PEBBLE_SMOOTH * (smooth_over(shade, self.paint, 2.5 * k) - shade)
+        self.gloss = gloss + PEBBLE_SMOOTH * (smooth_over(gloss, self.paint, 2.5 * k) - gloss)
+        self.gloss = self.gloss + RIM_LIGHT * smoothstep(0.935, 1.0, rho) ** 2
+
+        # Broad light across the ball, for lighting the letters.
+        self.light_shade = smooth_over(shade, self.paint, 14 * k)
+        self.light_gloss = smooth_over(self.gloss, self.paint, 6 * k)
+
         # Middle seam: the band of seam rows closest to the centre.
-        H, W = core.shape
         cols = slice(int(self.cx - 0.3 * self.r), int(self.cx + 0.3 * self.r))
-        count = self.seam[:, cols].sum(1).astype(float)
+        count = (seam[:, cols] > 0.5).sum(1).astype(float)
         count[np.abs(np.arange(H) - self.cy) > 0.2 * self.r] = 0
         band = np.nonzero(count > 0.6 * count.max())[0]
         self.seam_y = float(band.mean())
-        self.seam_thickness = int(band.max() - band.min() + 1)
-
-        self.texture = self._pebble_texture(rgb, solid)
-
-    def _pebble_texture(self, rgb, solid):
-        """Pebble detail in 0..1 (1 = pebble tops), with the seams filled in
-        from just above so no seam shows through the print."""
-        lum = rgb @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-        ball = (solid & ~self.seam).astype(np.float32)
-        sigma = 4.0 * self.r / 555.0
-        local = blur(lum * ball, sigma) / np.maximum(blur(ball, sigma), 1e-6)
-        ratio = np.where(ball > 0, lum / np.maximum(local, 1e-4), 1.0)
-        tex = np.clip(ratio / np.percentile(ratio[ball > 0], 95), 0.0, 1.0)
-        # Replace the seams (and their raised lips) with a block of pebbles
-        # copied from far enough above, so the copy keeps its structure.
-        lip = max(2, round(5 * self.r / 555.0))
-        hidden = dilate(self.seam, lip) & solid
-        step = self.seam_thickness + 2 * lip + 4
-        pending = hidden.copy()
-        source_ok = solid & ~hidden
-        for m in range(1, 12):
-            if not pending.any():
-                break
-            k = m * step
-            shifted = np.ones_like(tex)
-            shifted[k:] = tex[:-k]
-            ok = np.zeros_like(pending)
-            ok[k:] = source_ok[:-k]
-            take = pending & ok
-            tex[take] = shifted[take]
-            pending &= ~take
-        tex[pending] = 1.0
-        return tex
 
     def render(self, ball_rgb):
         """The recoloured ball in linear light."""
         team = srgb_to_linear(np.asarray(ball_rgb, dtype=np.float32) / 255.0)
-        lit = compress_highlights(shoulder(self.maps.shade[..., None] * team) + self.maps.gloss[..., None])
+        lit = compress_highlights(shoulder(self.shade[..., None] * team) + self.gloss[..., None])
         p = self.paint[..., None]
         return p * lit + (1.0 - p) * self.maps.neutral[..., None]
 
 
-def text_masks(text, font_path, cap_flat, max_width_flat, ss):
-    """Flat masks at ss x master scale: (fill, letters+outline, inner shadow,
-    centre column, centre row)."""
+def text_masks(text, font_path, cap_flat, width_flat, ss):
+    """Flat masks at ss x master scale: (fill, letters+outline, centre column,
+    centre row)."""
     probe = load_font(font_path, 400)
     cap_ratio = -probe.getbbox("H", anchor="ls")[1] / 400.0
-    font = load_font(font_path, max(8, round(cap_flat * ss / cap_ratio)))
-    cap = cap_ratio * font.size
-    track = TEXT_TRACKING * cap
-    pad = int(cap * 0.5) + 8
+    # The letters are made heavier by stroking them in their own colour; the
+    # stroke adds to the cap height, so start the font a little smaller.
+    cap_target = cap_flat * ss
+    font = load_font(font_path, max(8, round(cap_target / (cap_ratio + 2 * EMBOLDEN))))
+    bold = max(1, round(EMBOLDEN * cap_target))
+    cap = cap_ratio * font.size + 2 * bold
+    track = TEXT_TRACKING * cap + 2 * bold
+    pad = int(cap * 0.4) + bold + 8
     advance = [font.getlength(text[:i]) + i * track for i in range(len(text) + 1)]
     W, H = int(math.ceil(advance[-1])) + 2 * pad, int(math.ceil(cap)) + 2 * pad
     canvas = Image.new("L", (W, H), 0)
     draw = ImageDraw.Draw(canvas)
-    baseline = pad + cap
+    baseline = pad + cap - bold
     for i, ch in enumerate(text):
-        draw.text((pad + advance[i], baseline), ch, font=font, fill=255, anchor="ls")
+        draw.text((pad + advance[i] + bold, baseline), ch, font=font, fill=255, anchor="ls",
+                  stroke_width=bold, stroke_fill=255)
     l, t, r, b = canvas.getbbox()
-    # Natural proportions; a word too wide for the ball shrinks as a whole.
-    k = min(1.0, max_width_flat * ss / (r - l))
-    if k < 1.0:
-        canvas = canvas.resize((max(1, round(W * k)), max(1, round(H * k))), Image.LANCZOS)
+
+    # Narrow or widen a little to hit the target width; a word still too wide
+    # shrinks as a whole.
+    sx = width_flat * ss / (r - l)
+    k = 1.0
+    if sx < STRETCH_LIMITS[0]:
+        k = sx / STRETCH_LIMITS[0]
+    sx = min(max(sx, STRETCH_LIMITS[0]), STRETCH_LIMITS[1]) * k
+    canvas = canvas.resize((max(1, round(W * sx)), max(1, round(H * k))), Image.LANCZOS)
     fill = np.asarray(canvas, dtype=np.float32) / 255.0
-    cx, cy = (l + r) / 2 * k, (baseline - cap / 2) * k
+    cx, cy = (l + r) / 2 * sx, (t + b) / 2 * k
     cap *= k
 
-    # Outline: grow the letters by the outline width.
     radius = OUTLINE * cap
     margin = int(math.ceil(radius)) + 2
     fill = np.pad(fill, margin)
-    cx, cy = cx + margin, cy + margin
     dist = grow_distance(fill > 0.5, np.ones(fill.shape, bool), limit=margin + 2)
     outer = np.maximum(fill, np.clip(radius + 0.5 - dist, 0.0, 1.0))
-
-    # Inner shadow: the outside of the letters, nudged down and blurred, as
-    # seen through the letters, so the top inner edge is shaded.
-    off = max(1, round(INNER_SHADOW_OFFSET * cap))
-    outside = np.pad(1.0 - fill, ((off, 0), (0, 0)), constant_values=1.0)[:fill.shape[0]]
-    soft = Image.fromarray(np.round(outside * 255).astype(np.uint8)).filter(
-        ImageFilter.GaussianBlur(INNER_SHADOW_SOFTNESS * cap))
-    shadow = fill * (np.asarray(soft, dtype=np.float32) / 255.0)
-    return fill, outer, shadow, cx, cy
+    return fill, outer, cx + margin, cy + margin
 
 
 def print_text(ball, base_lin, text, text_rgb, outline_rgb, font_path, ss=4):
@@ -201,25 +184,30 @@ def print_text(ball, base_lin, text, text_rgb, outline_rgb, font_path, ss=4):
     rv = BULGE_RADIUS * ball.r
     # Flat sizes whose projection onto the sphere has the target screen size.
     cap_flat = 2 * rv * math.asin(min(TEXT_CAP * ball.r / rv, 1.0))
-    width_flat = 2 * rv * math.asin(min(TEXT_MAX_WIDTH * ball.r / rv, 1.0))
-    fill_m, outer_m, shadow_m, mcx, mcy = text_masks(text, font_path, cap_flat, width_flat, ss)
+    width_flat = 2 * rv * math.asin(min(TEXT_WIDTH * ball.r / rv, 1.0))
+    fill_m, outer_m, mcx, mcy = text_masks(text, font_path, cap_flat, width_flat, ss)
     layout = TextLayout(center=(ball.cx, ball.seam_y), max_width=1e9, cap_height=cap_flat, tilt_deg=0.0,
                         sphere_center=(ball.cx, ball.cy), sphere_radius=rv)
     warp = lambda m: place_lettering(m, mcx, mcy, ss, layout, base_lin.shape[:2], style="3d")
-    fill, outer, shadow = warp(fill_m), warp(outer_m), warp(shadow_m)
+    # The seams run across the print.
+    fill, outer = warp(fill_m) * ball.paint, warp(outer_m) * ball.paint
 
+    # Light the letters like the ball: its broad shading relative to the
+    # middle of the text, plus some of its sheen.
+    inside = fill > 0.5
+    ref = np.median(ball.light_shade[inside]) if inside.any() else 1.0
+    light = np.clip(ball.light_shade / max(ref, 1e-6), 0.4, 1.3) ** LETTER_SHADING
     rows = np.nonzero(outer.max(1) > 0.05)[0]
-    t = np.zeros(outer.shape[0], np.float32)
     if len(rows):
         t = np.clip((np.arange(outer.shape[0]) - rows[0]) / max(rows[-1] - rows[0], 1), 0.0, 1.0)
-    grad = (1.0 - FILL_GRADIENT * t)[:, None, None]
-    fill_srgb = np.clip(np.asarray(text_rgb, dtype=np.float32) / 255.0 * grad, 0.0, 1.0)
-    fill_lin = srgb_to_linear(fill_srgb) * (1.0 - INNER_SHADOW * shadow[..., None])
-    outline_lin = srgb_to_linear(np.asarray(outline_rgb, dtype=np.float32) / 255.0)
-    printed = (1.0 - TEXTURE_AMOUNT * (1.0 - ball.texture))[..., None]
+        light = light * (1.0 - LETTER_GRADIENT * t)[:, None]
+    sheen = LETTER_GLOSS * ball.light_gloss
+    lin = lambda rgb: srgb_to_linear(np.asarray(rgb, dtype=np.float32) / 255.0)
+    fill_lin = compress_highlights(lin(text_rgb) * light[..., None] + sheen[..., None])
+    outline_lin = compress_highlights(lin(outline_rgb) * light[..., None] + sheen[..., None])
 
-    out = base_lin + outer[..., None] * (outline_lin * printed - base_lin)
-    return out + fill[..., None] * (fill_lin * printed - out)
+    out = base_lin + outer[..., None] * (outline_lin - base_lin)
+    return out + fill[..., None] * (fill_lin - out)
 
 
 def read_balls(path: Path):
@@ -256,8 +244,8 @@ def main(argv=None):
     ap.add_argument("--master", type=Path, default=HERE / "master_ball.png")
     ap.add_argument("--teams", type=Path, default=HERE / "balls.csv")
     ap.add_argument("--out", type=Path, default=HERE / "output" / "balls")
-    ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Anton-Regular.ttf",
-                    help="TTF/OTF for the abbreviation (default: Anton, as on the helmets)")
+    ap.add_argument("--font", type=Path, default=HERE / "fonts" / "Graduate-Regular.ttf",
+                    help="TTF/OTF for the abbreviation (default: Graduate, collegiate block, emboldened)")
     ap.add_argument("--size", type=int, default=1024, help="square canvas size in px (default 1024)")
     ap.add_argument("--margin", type=float, default=0.04, help="empty border, fraction of the canvas")
     ap.add_argument("--no-preview", action="store_true", help="skip preview.png")
@@ -269,12 +257,12 @@ def main(argv=None):
     print(f"  ball centre ({ball.cx:.0f}, {ball.cy:.0f}) radius {ball.r:.0f}, middle seam y={ball.seam_y:.0f}")
 
     args.out.mkdir(parents=True, exist_ok=True)
-    entries, seen = [], {}
+    entries, seen = [], set()
     for team in teams:
         slug = slugify(team["abbr"])
         if slug in seen:
             print(f"  warning: {team['abbr']!r} overwrites an earlier {slug}.png", file=sys.stderr)
-        seen[slug] = True
+        seen.add(slug)
         lin = ball.render(team["ball"])
         lin = print_text(ball, lin, team["abbr"], team["text"], team["outline"], args.font)
         rgb8 = np.round(linear_to_srgb(lin) * 255).astype(np.uint8)

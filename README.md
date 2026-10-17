@@ -45,7 +45,7 @@ position, and the text is drawn after the flip, so it never reads backwards.
 ## Fonts
 
 Helmet text uses `fonts/Anton-Regular.ttf` (heavy condensed, Impact-style) and ball text uses
-`fonts/Fredoka-Bold.ttf` (chunky rounded). Use `--font` for another TTF/OTF. The preview labels
+`fonts/Graduate-Regular.ttf` (collegiate block). Use `--font` for another TTF/OTF. The preview labels
 use `fonts/Oswald-Bold.ttf`. All are SIL Open Font License (`fonts/OFL-*.txt`).
 
 ## Basketballs
@@ -64,12 +64,13 @@ position for all) and `preview.png` on the app's dark card color `#1A1A22`.
 | `abbr` | yes | text on the ball and the file name (`BOS` -> `BOS.png`) |
 | `ball_hex` | yes | ball color (shading and pebble texture are kept; black seams stay as they are) |
 | `team` | no | label in the preview |
-| `text_hex` | no | text fill. Default white. |
-| `outline_hex` | no | text outline. Default: the ball color 45% darker. |
+| `text_hex` | no | text fill. Default near-white `#F4F4F2`. |
+| `outline_hex` | no | thin text outline, usually the team accent color. Default: the ball color 45% darker. |
 
-The abbreviation is printed big across the middle seam (cap height 40% of the ball) in the
-same lettering as the helmets: Anton at its natural width, white, outline 5% of the letter
-height. It is wrapped onto the sphere, with a subtle top-to-bottom gradient, the pebble
-texture multiplied over it at 20% and a soft inner shadow. The master's faint pink
-edge halo is trimmed off (alpha eroded 2px, feathered 1px). The look is tuned with the
+The ball's pebbling is softened to a satin finish with a thin light rim. The abbreviation is
+printed big across the middle (cap height 45% of the ball, width 72%) in Graduate, a collegiate
+block font, emboldened: white, fading slightly grey towards the bottom, lit like the ball, with a
+thin outline in `outline_hex` (the team accent color), wrapped onto the sphere, and the middle
+seam running across it. The master's faint pink edge halo is trimmed off (alpha eroded 2px,
+feathered 1px). The look is tuned with the
 constants at the top of `make_balls.py`.
