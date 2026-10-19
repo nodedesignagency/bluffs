@@ -30,7 +30,7 @@ the user asks. In short:
 - Letter pairs whose outlines touch get extra room in `PAIR_SPACE` (fraction of cap height). `LA` has
   0.08 (LAC, LAL); every other abbreviation is unaffected.
 
-## Done (10 of 30), all approved
+## Done (30 of 30), all approved
 
 | Team | Abbr | Ball | Text | Outline |
 |---|---|---|---|---|
@@ -44,10 +44,35 @@ the user asks. In short:
 | Detroit Pistons | DET | #1D42BA | #E9072B red | #F4F4F2 white |
 | Milwaukee Bucks | MIL | #00471B | white | #EEE1C6 cream |
 | Indiana Pacers | IND | #FDBB30 yellow | #002D62 navy | #BFC1C2 silver |
+| Atlanta Hawks | ATL | #C8102E red | #FDB927 yellow | #F4F4F2 white |
+| Charlotte Hornets | CHA | #0B8AA6 teal | white | #1D1160 purple |
+| Miami Heat | MIA | #98002E crimson | white | #F9A01B orange-yellow |
+| Orlando Magic | ORL | #C8C8C8 (white ball) | #1F55A6 blue | #1A1A1A black |
+| Washington Wizards | WAS | #E31837 red | #002B5C navy | #F4F4F2 white |
+| Denver Nuggets | DEN | #0D2240 navy | white | #FFC627 gold |
+| Minnesota Timberwolves | MIN | #22429B royal | #4CA68B mint green | #F4F4F2 white |
+| Oklahoma City Thunder | OKC | #F05133 orange | white | #002D62 navy |
+| Portland Trail Blazers | POR | #2A2A2A charcoal | #CF0A2C red | #F4F4F2 white |
+| Utah Jazz | UTA | #48258C purple | #1A1A1A black | #F4F4F2 white |
+| Golden State Warriors | GSW | #00408D blue | #FFBA00 yellow | #F4F4F2 white |
+| Los Angeles Clippers | LAC | #8DB4E2 light blue | #0A2240 navy | #CE0E2D red |
+| Los Angeles Lakers | LAL | #FDB927 yellow | #31006F purple | #F4F4F2 white |
+| Phoenix Suns | PHX | #B695E8 lavender | white | #E56020 orange |
+| Sacramento Kings | SAC | #5E6670 slate | #5B2C82 purple | #F4F4F2 white |
+| Dallas Mavericks | DAL | #007DC5 blue | #1A1A1A black | #F4F4F2 white |
+| Houston Rockets | HOU | #FFD520 lemon yellow | #CE0E2D red | #F4F4F2 white |
+| Memphis Grizzlies | MEM | #4F77AC steel blue | #0B1338 navy | #FFB300 gold |
+| New Orleans Pelicans | NOP | #001E3F navy | #C69857 gold | #E31837 red |
+| San Antonio Spurs | SAS | #8E9AA1 silver | #1A1A1A black | #F4F4F2 white |
 
-## Remaining (20)
+Several teams were moved off their obvious colors so no two balls look alike (ORL, POR, GSW, LAC, SAC, HOU,
+MEM, NOP); the user approved each one.
 
-ATL, CHA, MIA, ORL, WAS, DEN, MIN, OKC, POR, UTA, GSW, LAC, LAL, PHX, SAC, DAL, HOU, MEM, NOP, SAS.
+## Delivered
+
+All 30 were delivered as one zip: files renamed to full team names like the NFL zip
+(`Boston_Celtics.png`, `slugify` of the team column) plus `preview.png`. The renders themselves still
+write `output/balls/<ABBR>.png`.
 
 ## Workflow, one team at a time
 
