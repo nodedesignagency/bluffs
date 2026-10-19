@@ -45,7 +45,8 @@ position, and the text is drawn after the flip, so it never reads backwards.
 ## Fonts
 
 Helmet text uses `fonts/Anton-Regular.ttf` (heavy condensed, Impact-style) and ball text uses
-`fonts/Graduate-Regular.ttf` (collegiate block). Use `--font` for another TTF/OTF. The preview labels
+`fonts/Graduate-Regular.ttf` (collegiate block); its M fills in when bolded, so `make_balls.py`
+draws its own M in the same style (`m_outline`). Use `--font` for another TTF/OTF. The preview labels
 use `fonts/Oswald-Bold.ttf`. All are SIL Open Font License (`fonts/OFL-*.txt`).
 
 ## Basketballs

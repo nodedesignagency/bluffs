@@ -48,6 +48,13 @@ TEXT_WIDTH = 0.72                # text width, fraction of the ball's width
 STRETCH_LIMITS = (0.80, 1.25)    # how far the letters may be narrowed / widened to hit TEXT_WIDTH
 TEXT_TRACKING = 0.03             # letter spacing, fraction of cap height
 EMBOLDEN = 0.04                  # extra stroke weight, fraction of cap height (Graduate is light)
+# Graduate's own M fills in when it is bolded, so the M is drawn from its
+# measurements (font units, cap height 750) with thinner diagonals and a
+# little more width, which keeps its notches open.
+M_WIDTH = 1130                   # advance width (Graduate: 946)
+M_DEPTH = 330                    # the top V notch comes down to this height (Graduate: 194)
+M_FOOT = 282                     # inner foot serifs end here (Graduate: 312)
+M_V_BOTTOM = 96                  # flat bottom of the middle V, on the baseline
 BULGE_RADIUS = 1.0               # sphere the text wraps on, x ball radius (1 = full curve)
 
 TEXT_FILL = (0xF4, 0xF4, 0xF2)
@@ -166,6 +173,56 @@ class Ball:
         return p * lit + (1.0 - p) * self.maps.neutral[..., None]
 
 
+def m_outline(width=None, depth=None, foot=None, v_bottom=None):
+    """Collegiate M as a polygon in font units (y up, baseline 0, cap 750),
+    matching Graduate's stems, slab serifs and feet: heavy diagonals meet in
+    a V that comes down to the baseline, with a V notch from the top down to
+    height `depth` and narrow notches between each foot and the V."""
+    W = M_WIDTH if width is None else width
+    y_v = M_DEPTH if depth is None else depth
+    foot = M_FOOT if foot is None else foot          # inner foot serifs end here
+    vb = M_V_BOTTOM if v_bottom is None else v_bottom  # width of the V's flat bottom
+    cx = W / 2
+    # Inner edge of the left diagonal: from the stem (Graduate's 242, 617)
+    # down to the left corner of the V's flat bottom on the baseline. The
+    # outer edge runs parallel to it through the bottom of the top notch.
+    x1, y1 = 242.0, 617.0
+    x2, y2 = cx - vb / 2, 0.0
+    slope = (x2 - x1) / (y2 - y1)                  # dx per unit of y along the diagonal
+    x_top = cx + (750.0 - y_v) * slope             # outer edge meets the top
+    pts = [(80, 750), (x_top, 750), (cx, y_v), (W - x_top, 750), (W - 80, 750), (W - 80, 670),
+           (W - 150, 670), (W - 150, 80), (W - 80, 80), (W - 80, 0), (W - foot, 0), (W - foot, 80),
+           (W - 242, 80), (W - 242, y1), (W - x2, y2), (x2, y2), (x1, y1), (242, 80), (foot, 80),
+           (foot, 0), (80, 0), (80, 80), (150, 80), (150, 670), (80, 670)]
+    return pts, W
+
+
+def draw_custom(img, ch, x, baseline, scale, stroke, supersample=2):
+    """Draw a custom glyph onto an L image at pen position x, grown by
+    `stroke` px with round joins, like a stroked font glyph."""
+    pts, _ = m_outline()
+    k = supersample
+    xs = [x + px * scale for px, _ in pts]
+    ys = [baseline - py * scale for _, py in pts]
+    x0, y0 = int(min(xs) - stroke - 2), int(min(ys) - stroke - 2)
+    x1, y1 = int(max(xs) + stroke + 3), int(max(ys) + stroke + 3)
+    big = Image.new("L", ((x1 - x0) * k, (y1 - y0) * k), 0)
+    draw = ImageDraw.Draw(big)
+    poly = [((px - x0) * k, (py - y0) * k) for px, py in zip(xs, ys)]
+    draw.polygon(poly, fill=255)
+    if stroke > 0:
+        r = stroke * k
+        draw.line(poly + [poly[0]], fill=255, width=int(round(2 * r)), joint="curve")
+        for px, py in poly:
+            draw.ellipse((px - r, py - r, px + r, py + r), fill=255)
+    small = big.resize((x1 - x0, y1 - y0), Image.BOX)
+    region = (x0, y0, x1, y1)
+    img.paste(Image.fromarray(np.maximum(np.asarray(img.crop(region)), np.asarray(small))), region)
+
+
+CUSTOM_GLYPHS = {"M": m_outline}
+
+
 def text_masks(text, font_path, cap_flat, width_flat, ss):
     """Flat masks at ss x master scale: (fill, letters+outline, centre column,
     centre row)."""
@@ -179,14 +236,23 @@ def text_masks(text, font_path, cap_flat, width_flat, ss):
     cap = cap_ratio * font.size + 2 * bold
     track = TEXT_TRACKING * cap + 2 * bold
     pad = int(cap * 0.4) + bold + 8
-    advance = [font.getlength(text[:i]) + i * track for i in range(len(text) + 1)]
+    units = font.size / 1000.0                     # px per font unit (Graduate: 1000 per em)
+    if any(ch in CUSTOM_GLYPHS for ch in text):
+        widths = [CUSTOM_GLYPHS[ch]()[1] * units if ch in CUSTOM_GLYPHS else font.getlength(ch) for ch in text]
+        advance = [sum(widths[:i]) + i * track for i in range(len(text) + 1)]
+    else:
+        advance = [font.getlength(text[:i]) + i * track for i in range(len(text) + 1)]
     W, H = int(math.ceil(advance[-1])) + 2 * pad, int(math.ceil(cap)) + 2 * pad
+    baseline = pad + cap - bold
+
     canvas = Image.new("L", (W, H), 0)
     draw = ImageDraw.Draw(canvas)
-    baseline = pad + cap - bold
     for i, ch in enumerate(text):
-        draw.text((pad + advance[i] + bold, baseline), ch, font=font, fill=255, anchor="ls",
-                  stroke_width=bold, stroke_fill=255)
+        x = pad + advance[i] + bold
+        if ch in CUSTOM_GLYPHS:
+            draw_custom(canvas, ch, x, baseline, units, bold)
+        else:
+            draw.text((x, baseline), ch, font=font, fill=255, anchor="ls", stroke_width=bold, stroke_fill=255)
     l, t, r, b = canvas.getbbox()
 
     # Narrow or widen a little to hit the target width; a word still too wide
