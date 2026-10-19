@@ -223,6 +223,9 @@ def draw_custom(img, ch, x, baseline, scale, stroke, supersample=2):
 
 
 CUSTOM_GLYPHS = {"M": m_outline}
+# Letter pairs that touch at the default spacing get this much extra room
+# (fraction of cap height): the L's foot runs into the A's left leg.
+PAIR_SPACE = {"LA": 0.08}
 
 
 def text_masks(text, font_path, cap_flat, width_flat, ss):
@@ -244,6 +247,8 @@ def text_masks(text, font_path, cap_flat, width_flat, ss):
         advance = [sum(widths[:i]) + i * track for i in range(len(text) + 1)]
     else:
         advance = [font.getlength(text[:i]) + i * track for i in range(len(text) + 1)]
+    advance = [a + sum(PAIR_SPACE.get(text[j - 1:j + 1], 0.0) for j in range(1, i + 1)) * cap
+               for i, a in enumerate(advance)]
     W, H = int(math.ceil(advance[-1])) + 2 * pad, int(math.ceil(cap)) + 2 * pad
     baseline = pad + cap - bold
 

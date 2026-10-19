@@ -27,6 +27,8 @@ the user asks. In short:
   (MIA, MIN, MEM) uses it automatically.
 - W, X and K were checked and read fine. If the user dislikes one, use the same fix as the M: add a
   custom glyph to `CUSTOM_GLYPHS` and change only that letter.
+- Letter pairs whose outlines touch get extra room in `PAIR_SPACE` (fraction of cap height). `LA` has
+  0.08 (LAC, LAL); every other abbreviation is unaffected.
 
 ## Done (10 of 30), all approved
 
