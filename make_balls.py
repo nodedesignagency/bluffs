@@ -52,7 +52,7 @@ EMBOLDEN = 0.04                  # extra stroke weight, fraction of cap height (
 # measurements (font units, cap height 750) with thinner diagonals and a
 # little more width, which keeps its notches open.
 M_WIDTH = 1130                   # advance width (Graduate: 946)
-M_DEPTH = 330                    # the top V notch comes down to this height (Graduate: 194)
+M_DIAGONAL = 92                  # diagonal thickness before bolding, same as the stems (Graduate: 83)
 M_FOOT = 282                     # inner foot serifs end here (Graduate: 312)
 M_V_BOTTOM = 96                  # flat bottom of the middle V, on the baseline
 BULGE_RADIUS = 1.0               # sphere the text wraps on, x ball radius (1 = full curve)
@@ -173,22 +173,24 @@ class Ball:
         return p * lit + (1.0 - p) * self.maps.neutral[..., None]
 
 
-def m_outline(width=None, depth=None, foot=None, v_bottom=None):
+def m_outline(width=None, diagonal=None, foot=None, v_bottom=None):
     """Collegiate M as a polygon in font units (y up, baseline 0, cap 750),
-    matching Graduate's stems, slab serifs and feet: heavy diagonals meet in
-    a V that comes down to the baseline, with a V notch from the top down to
-    height `depth` and narrow notches between each foot and the V."""
+    matching Graduate's stems, slab serifs and feet: diagonals as thick as
+    the stems meet in a V that comes down to the baseline, with a V notch
+    from the top and narrow notches between each foot and the V."""
     W = M_WIDTH if width is None else width
-    y_v = M_DEPTH if depth is None else depth
+    d = M_DIAGONAL if diagonal is None else diagonal
     foot = M_FOOT if foot is None else foot          # inner foot serifs end here
     vb = M_V_BOTTOM if v_bottom is None else v_bottom  # width of the V's flat bottom
     cx = W / 2
     # Inner edge of the left diagonal: from the stem (Graduate's 242, 617)
     # down to the left corner of the V's flat bottom on the baseline. The
-    # outer edge runs parallel to it through the bottom of the top notch.
+    # outer edge runs parallel to it, d further along the stroke's normal.
     x1, y1 = 242.0, 617.0
     x2, y2 = cx - vb / 2, 0.0
     slope = (x2 - x1) / (y2 - y1)                  # dx per unit of y along the diagonal
+    shift = d * math.hypot(1.0, slope)             # horizontal offset of the outer edge
+    y_v = (x2 + shift - cx) / -slope               # outer edges meet: bottom of the top notch
     x_top = cx + (750.0 - y_v) * slope             # outer edge meets the top
     pts = [(80, 750), (x_top, 750), (cx, y_v), (W - x_top, 750), (W - 80, 750), (W - 80, 670),
            (W - 150, 670), (W - 150, 80), (W - 80, 80), (W - 80, 0), (W - foot, 0), (W - foot, 80),
